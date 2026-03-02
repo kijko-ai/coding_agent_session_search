@@ -1950,13 +1950,14 @@ impl FrankenStorage {
             fparams![id],
             |row| {
                 let kind_str: String = row.get_typed(1)?;
+                let config_json_str: Option<String> = row.get_typed(5)?;
                 Ok(Source {
                     id: row.get_typed(0)?,
-                    kind: SourceKind::from_str(&kind_str),
+                    kind: SourceKind::parse(&kind_str).unwrap_or_default(),
                     host_label: row.get_typed(2)?,
                     machine_id: row.get_typed(3)?,
                     platform: row.get_typed(4)?,
-                    config_json: row.get_typed(5)?,
+                    config_json: config_json_str.and_then(|s| serde_json::from_str(&s).ok()),
                     created_at: row.get_typed(6)?,
                     updated_at: row.get_typed(7)?,
                 })
@@ -1973,13 +1974,14 @@ impl FrankenStorage {
                 fparams![],
                 |row| {
                     let kind_str: String = row.get_typed(1)?;
+                    let config_json_str: Option<String> = row.get_typed(5)?;
                     Ok(Source {
                         id: row.get_typed(0)?,
-                        kind: SourceKind::from_str(&kind_str),
+                        kind: SourceKind::parse(&kind_str).unwrap_or_default(),
                         host_label: row.get_typed(2)?,
                         machine_id: row.get_typed(3)?,
                         platform: row.get_typed(4)?,
-                        config_json: row.get_typed(5)?,
+                        config_json: config_json_str.and_then(|s| serde_json::from_str(&s).ok()),
                         created_at: row.get_typed(6)?,
                         updated_at: row.get_typed(7)?,
                     })
@@ -2105,7 +2107,7 @@ impl FrankenStorage {
     ) -> Result<InsertOutcome> {
         let tx = self.conn.transaction()?;
 
-        let rows = tx.query_with_params(
+        let rows = tx.query_params(
             "SELECT MAX(idx) FROM messages WHERE conversation_id = ?1",
             fparams![conversation_id],
         )?;
@@ -2134,7 +2136,7 @@ impl FrankenStorage {
         if let Some(last_ts) = conv.messages.iter().filter_map(|m| m.created_at).max() {
             tx.execute_params(
                 "UPDATE conversations SET ended_at = MAX(IFNULL(ended_at, 0), ?1) WHERE id = ?2",
-                params![last_ts, conversation_id],
+                fparams![last_ts, conversation_id],
             )?;
         }
 
@@ -2180,7 +2182,7 @@ impl FrankenStorage {
                  FROM messages m
                  JOIN conversations c ON m.conversation_id = c.id
                  ORDER BY m.id",
-                params![],
+                fparams![],
                 |row| {
                     let source_id: String = row.get_typed::<Option<String>>(4)?
                         .unwrap_or_else(|| "local".to_string());
@@ -2204,7 +2206,7 @@ impl FrankenStorage {
             .query_map_collect(
                 "SELECT id, db_path, model_id, status, total_docs, completed_docs, error_message, created_at, started_at, completed_at
                  FROM embedding_jobs WHERE db_path = ?1 ORDER BY id DESC",
-                params![db_path],
+                fparams![db_path],
                 |row| {
                     Ok(EmbeddingJobRow {
                         id: row.get_typed(0)?,
@@ -2229,7 +2231,7 @@ impl FrankenStorage {
             "INSERT INTO embedding_jobs(db_path, model_id, total_docs) VALUES(?1,?2,?3)
              ON CONFLICT(db_path, model_id) WHERE status IN ('pending', 'running')
              DO UPDATE SET total_docs=excluded.total_docs",
-            params![db_path, model_id, total_docs],
+            fparams![db_path, model_id, total_docs],
         )?;
         let rows = self.conn.query("SELECT last_insert_rowid();")?;
         let id: i64 = rows
@@ -2243,7 +2245,7 @@ impl FrankenStorage {
     pub fn start_embedding_job(&self, job_id: i64) -> Result<()> {
         self.conn.execute_params(
             "UPDATE embedding_jobs SET status = 'running', started_at = datetime('now') WHERE id = ?1",
-            params![job_id],
+            fparams![job_id],
         )?;
         Ok(())
     }
@@ -2252,7 +2254,7 @@ impl FrankenStorage {
     pub fn complete_embedding_job(&self, job_id: i64) -> Result<()> {
         self.conn.execute_params(
             "UPDATE embedding_jobs SET status = 'completed', completed_at = datetime('now') WHERE id = ?1",
-            params![job_id],
+            fparams![job_id],
         )?;
         Ok(())
     }
@@ -2261,7 +2263,7 @@ impl FrankenStorage {
     pub fn fail_embedding_job(&self, job_id: i64, error: &str) -> Result<()> {
         self.conn.execute_params(
             "UPDATE embedding_jobs SET status = 'failed', error_message = ?2, completed_at = datetime('now') WHERE id = ?1",
-            params![job_id, error],
+            fparams![job_id, error],
         )?;
         Ok(())
     }
@@ -2271,12 +2273,12 @@ impl FrankenStorage {
         if let Some(mid) = model_id {
             Ok(self.conn.execute_params(
                 "UPDATE embedding_jobs SET status = 'cancelled' WHERE db_path = ?1 AND model_id = ?2 AND status IN ('pending', 'running')",
-                params![db_path, mid],
+                fparams![db_path, mid],
             )?)
         } else {
             Ok(self.conn.execute_params(
                 "UPDATE embedding_jobs SET status = 'cancelled' WHERE db_path = ?1 AND status IN ('pending', 'running')",
-                params![db_path],
+                fparams![db_path],
             )?)
         }
     }
@@ -2285,7 +2287,7 @@ impl FrankenStorage {
     pub fn update_job_progress(&self, job_id: i64, completed_docs: i64) -> Result<()> {
         self.conn.execute_params(
             "UPDATE embedding_jobs SET completed_docs = ?2 WHERE id = ?1",
-            params![job_id, completed_docs],
+            fparams![job_id, completed_docs],
         )?;
         Ok(())
     }
@@ -2313,12 +2315,15 @@ fn franken_insert_conversation(
 ) -> Result<i64> {
     let metadata_bin = serialize_json_to_msgpack(&conv.metadata_json);
 
+    let metadata_json_str = serde_json::to_string(&conv.metadata_json)?;
+    let metadata_bin_bytes = metadata_bin.as_deref();
+
     tx.execute_params(
         "INSERT INTO conversations(
             agent_id, workspace_id, source_id, external_id, title, source_path,
             started_at, ended_at, approx_tokens, metadata_json, origin_host, metadata_bin
         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
-        params![
+        fparams![
             agent_id,
             workspace_id,
             conv.source_id.as_str(),
@@ -2328,9 +2333,9 @@ fn franken_insert_conversation(
             conv.started_at,
             conv.ended_at,
             conv.approx_tokens,
-            serde_json::to_string(&conv.metadata_json)?,
+            metadata_json_str.as_str(),
             conv.origin_host.as_deref(),
-            metadata_bin.as_deref()
+            metadata_bin_bytes
         ],
     )?;
     franken_last_rowid(tx)
@@ -2344,18 +2349,21 @@ fn franken_insert_message(
 ) -> Result<i64> {
     let extra_bin = serialize_json_to_msgpack(&msg.extra_json);
 
+    let extra_json_str = serde_json::to_string(&msg.extra_json)?;
+    let extra_bin_bytes = extra_bin.as_deref();
+
     tx.execute_params(
         "INSERT INTO messages(conversation_id, idx, role, author, created_at, content, extra_json, extra_bin)
          VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
-        params![
+        fparams![
             conversation_id,
             msg.idx,
             role_str(&msg.role),
             msg.author.as_deref(),
             msg.created_at,
             msg.content.as_str(),
-            serde_json::to_string(&msg.extra_json)?,
-            extra_bin.as_deref()
+            extra_json_str.as_str(),
+            extra_bin_bytes
         ],
     )?;
     franken_last_rowid(tx)
@@ -2368,12 +2376,13 @@ fn franken_insert_snippets(
     snippets: &[Snippet],
 ) -> Result<()> {
     for snip in snippets {
+        let file_path_str = snip.file_path.as_ref().map(|p| path_to_string(p));
         tx.execute_params(
             "INSERT INTO snippets(message_id, file_path, start_line, end_line, language, snippet_text)
              VALUES(?1,?2,?3,?4,?5,?6)",
-            params![
+            fparams![
                 message_id,
-                snip.file_path.as_ref().map(|p| path_to_string(p)),
+                file_path_str.as_deref(),
                 snip.start_line,
                 snip.end_line,
                 snip.language.as_deref(),
@@ -2461,7 +2470,7 @@ fn franken_update_daily_stats_in_tx(
             message_count = message_count + excluded.message_count,
             total_chars = total_chars + excluded.total_chars,
             last_updated = excluded.last_updated",
-        params![day_id, agent_slug, source_id, session_delta, message_delta, chars_delta, now],
+        fparams![day_id, agent_slug, source_id, session_delta, message_delta, chars_delta, now],
     )?;
 
     // Update 'all' agent entry
@@ -2473,7 +2482,7 @@ fn franken_update_daily_stats_in_tx(
             message_count = message_count + excluded.message_count,
             total_chars = total_chars + excluded.total_chars,
             last_updated = excluded.last_updated",
-        params![day_id, source_id, session_delta, message_delta, chars_delta, now],
+        fparams![day_id, source_id, session_delta, message_delta, chars_delta, now],
     )?;
 
     // Update 'all' source entry
@@ -2485,7 +2494,7 @@ fn franken_update_daily_stats_in_tx(
             message_count = message_count + excluded.message_count,
             total_chars = total_chars + excluded.total_chars,
             last_updated = excluded.last_updated",
-        params![day_id, agent_slug, session_delta, message_delta, chars_delta, now],
+        fparams![day_id, agent_slug, session_delta, message_delta, chars_delta, now],
     )?;
 
     // Update global 'all'/'all' entry
@@ -2497,7 +2506,7 @@ fn franken_update_daily_stats_in_tx(
             message_count = message_count + excluded.message_count,
             total_chars = total_chars + excluded.total_chars,
             last_updated = excluded.last_updated",
-        params![day_id, session_delta, message_delta, chars_delta, now],
+        fparams![day_id, session_delta, message_delta, chars_delta, now],
     )?;
 
     Ok(())
