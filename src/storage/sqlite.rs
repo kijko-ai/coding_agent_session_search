@@ -10,6 +10,7 @@ use frankensqlite::{
         OpenFlags as FrankenOpenFlags, OptionalExtension as FrankenOptionalExtension, ParamValue,
         RowExt as FrankenRowExt, Transaction as FrankenTransaction,
         TransactionExt as FrankenTransactionExt, open_with_flags as open_franken_with_flags,
+        param_slice_to_values,
     },
     migrate::MigrationRunner,
 };
@@ -46,6 +47,11 @@ pub enum LazyDbError {
     OpenFailed {
         path: PathBuf,
         source: rusqlite::Error,
+    },
+    #[error("Failed to open FrankenSQLite database at {path}: {source}")]
+    FrankenOpenFailed {
+        path: PathBuf,
+        source: frankensqlite::FrankenError,
     },
 }
 
@@ -136,6 +142,316 @@ impl LazyDb {
 }
 
 // -------------------------------------------------------------------------
+// LazyFrankenDb — lazy wrapper around FrankenConnection
+// -------------------------------------------------------------------------
+
+/// Wrapper around `FrankenConnection` that implements `Send`.
+///
+/// `FrankenConnection` is `!Send` because it uses `Rc` internally.
+/// However, the `Rc` values are entirely self-contained within the Connection
+/// and are not shared externally.  When wrapped in a `Mutex`,
+/// exclusive access is guaranteed, making cross-thread transfer safe.
+pub struct SendFrankenConnection(FrankenConnection);
+
+// Safety: Rc fields inside FrankenConnection are not cloned or shared externally.
+// The Mutex<Option<SendFrankenConnection>> ensures exclusive access.
+unsafe impl Send for SendFrankenConnection {}
+
+impl std::ops::Deref for SendFrankenConnection {
+    type Target = FrankenConnection;
+    fn deref(&self) -> &FrankenConnection {
+        &self.0
+    }
+}
+
+/// Lazy-opening wrapper for `FrankenConnection` (frankensqlite).
+///
+/// Constructing a `LazyFrankenDb` is cheap (no I/O).  The underlying
+/// `FrankenConnection` is opened on the first call to [`get`].
+/// Subsequent calls return the cached connection.
+pub struct LazyFrankenDb {
+    path: PathBuf,
+    conn: parking_lot::Mutex<Option<SendFrankenConnection>>,
+}
+
+/// RAII guard that dereferences to the inner `FrankenConnection`.
+pub struct LazyFrankenDbGuard<'a>(parking_lot::MutexGuard<'a, Option<SendFrankenConnection>>);
+
+impl std::fmt::Debug for LazyFrankenDbGuard<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("LazyFrankenDbGuard")
+            .field(&self.0.is_some())
+            .finish()
+    }
+}
+
+impl std::ops::Deref for LazyFrankenDbGuard<'_> {
+    type Target = FrankenConnection;
+    fn deref(&self) -> &FrankenConnection {
+        self.0
+            .as_ref()
+            .expect("LazyFrankenDb connection must be initialized before access")
+    }
+}
+
+impl LazyFrankenDb {
+    /// Create a lazy handle pointing at `path`.  No I/O is performed.
+    pub fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            conn: parking_lot::Mutex::new(None),
+        }
+    }
+
+    /// Resolve path from optional CLI overrides.
+    ///
+    /// Uses `data_dir / agent_search.db` as fallback.
+    pub fn from_overrides(data_dir: &Option<PathBuf>, db_override: Option<PathBuf>) -> Self {
+        let data_dir = data_dir.clone().unwrap_or_else(crate::default_data_dir);
+        let path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
+        Self::new(path)
+    }
+
+    /// Get the connection, opening the database on first access.
+    ///
+    /// `reason` is logged alongside the open duration so callers can
+    /// identify which command triggered the open.
+    pub fn get(&self, reason: &str) -> std::result::Result<LazyFrankenDbGuard<'_>, LazyDbError> {
+        let mut guard = self.conn.lock();
+        if guard.is_none() {
+            if !self.path.exists() {
+                return Err(LazyDbError::NotFound(self.path.clone()));
+            }
+            let start = Instant::now();
+            let conn =
+                FrankenConnection::open(self.path.to_string_lossy().into_owned()).map_err(|e| {
+                    LazyDbError::FrankenOpenFailed {
+                        path: self.path.clone(),
+                        source: e,
+                    }
+                })?;
+            let elapsed_ms = start.elapsed().as_millis();
+            info!(
+                path = %self.path.display(),
+                elapsed_ms = elapsed_ms,
+                reason = reason,
+                "lazily opened FrankenSQLite database"
+            );
+            *guard = Some(SendFrankenConnection(conn));
+        }
+        Ok(LazyFrankenDbGuard(guard))
+    }
+
+    /// Path to the database file (even if not yet opened).
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Whether the connection has been opened.
+    pub fn is_open(&self) -> bool {
+        self.conn.lock().is_some()
+    }
+}
+
+// -------------------------------------------------------------------------
+// FrankenSQLite Connection Manager (bead 3rlf8)
+// -------------------------------------------------------------------------
+// Multi-connection management: reader pool + concurrent writer connections.
+// Replaces the LazyFrankenDb single-connection bottleneck for high-throughput
+// scenarios (indexer parallel writes, concurrent TUI reads + indexer writes).
+
+/// Configuration for the [`FrankenConnectionManager`].
+#[derive(Debug, Clone)]
+pub struct ConnectionManagerConfig {
+    /// Number of pre-opened reader connections (default: 4).
+    pub reader_count: usize,
+    /// Maximum concurrent writer connections (default: available parallelism).
+    pub max_writers: usize,
+}
+
+impl Default for ConnectionManagerConfig {
+    fn default() -> Self {
+        let cpus = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        Self {
+            reader_count: 4,
+            max_writers: cpus,
+        }
+    }
+}
+
+/// Multi-connection manager for frankensqlite.
+///
+/// Provides:
+/// - A pool of pre-opened reader connections (round-robin, Mutex-protected)
+/// - Controlled creation of writer connections with token-based limits
+/// - RAII guards that auto-rollback uncommitted transactions on drop
+///
+/// Thread-safe: reader connections are wrapped in Mutex (FrankenConnection is !Sync).
+/// Writer connections are created per-request (each thread gets its own).
+pub struct FrankenConnectionManager {
+    db_path: PathBuf,
+    readers: Vec<parking_lot::Mutex<SendFrankenConnection>>,
+    reader_idx: std::sync::atomic::AtomicUsize,
+    /// Token-based writer limit: channel pre-filled with `max_writers` tokens.
+    /// `recv()` = acquire slot, `send()` = release slot.
+    writer_tokens: (
+        crossbeam_channel::Sender<()>,
+        crossbeam_channel::Receiver<()>,
+    ),
+    config: ConnectionManagerConfig,
+}
+
+// Safety: FrankenConnectionManager is Send+Sync because:
+// - readers wrapped in Mutex<SendFrankenConnection> (exclusive access)
+// - writer_tokens uses crossbeam (Send+Sync)
+// - db_path is PathBuf (Send+Sync)
+unsafe impl Send for FrankenConnectionManager {}
+unsafe impl Sync for FrankenConnectionManager {}
+
+impl FrankenConnectionManager {
+    /// Create a new connection manager.
+    ///
+    /// Opens `config.reader_count` reader connections immediately.
+    /// Writer connections are created on demand (up to `config.max_writers`).
+    pub fn new(db_path: impl Into<PathBuf>, config: ConnectionManagerConfig) -> Result<Self> {
+        let db_path = db_path.into();
+        let path_str = db_path.to_string_lossy().to_string();
+
+        let mut readers = Vec::with_capacity(config.reader_count);
+        for _ in 0..config.reader_count {
+            let conn = FrankenConnection::open(&path_str)
+                .with_context(|| format!("opening reader connection at {}", db_path.display()))?;
+            // Apply read-tuned config (no migration, no write PRAGMAs)
+            let _ = conn.execute("PRAGMA cache_size = -16384;"); // 16MB reader cache
+            readers.push(parking_lot::Mutex::new(SendFrankenConnection(conn)));
+        }
+
+        // Pre-fill bounded channel with tokens (acts as counting semaphore)
+        let (tx, rx) = crossbeam_channel::bounded(config.max_writers);
+        for _ in 0..config.max_writers {
+            tx.send(()).expect("pre-filling writer tokens");
+        }
+
+        Ok(Self {
+            db_path,
+            readers,
+            reader_idx: std::sync::atomic::AtomicUsize::new(0),
+            writer_tokens: (tx, rx),
+            config,
+        })
+    }
+
+    /// Get a reader connection (round-robin from the pool).
+    ///
+    /// Returns a mutex guard wrapping the connection. The guard prevents
+    /// concurrent access to the same connection (FrankenConnection is !Sync).
+    pub fn reader(&self) -> parking_lot::MutexGuard<'_, SendFrankenConnection> {
+        let idx = self
+            .reader_idx
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.readers[idx % self.readers.len()].lock()
+    }
+
+    /// Acquire a writer connection.
+    ///
+    /// Opens a new frankensqlite connection with full config (no migration).
+    /// Blocks if `max_writers` connections are already in use.
+    /// The returned [`WriterGuard`] auto-rolls back on drop.
+    pub fn writer(&self) -> Result<WriterGuard<'_>> {
+        self.writer_tokens
+            .1
+            .recv()
+            .map_err(|_| anyhow!("writer token channel closed"))?;
+        let path_str = self.db_path.to_string_lossy().to_string();
+        let conn = FrankenConnection::open(&path_str)
+            .with_context(|| format!("opening writer connection at {}", self.db_path.display()))?;
+        let storage = FrankenStorage { conn };
+        storage.apply_config()?;
+        Ok(WriterGuard {
+            storage,
+            mgr: self,
+            committed: false,
+        })
+    }
+
+    /// Acquire a concurrent writer connection (BEGIN CONCURRENT via MVCC).
+    ///
+    /// Similar to [`writer`] but tuned for the parallel indexer write pool.
+    /// Uses reduced cache size and is designed for short-lived batch inserts.
+    pub fn concurrent_writer(&self) -> Result<WriterGuard<'_>> {
+        self.writer_tokens
+            .1
+            .recv()
+            .map_err(|_| anyhow!("writer token channel closed"))?;
+        let path_str = self.db_path.to_string_lossy().to_string();
+        let conn = FrankenConnection::open(&path_str)
+            .with_context(|| format!("opening concurrent writer at {}", self.db_path.display()))?;
+        let storage = FrankenStorage { conn };
+        storage.apply_config()?;
+        // Reduced cache for concurrent writers (they're short-lived)
+        let _ = storage.raw().execute("PRAGMA cache_size = -4096;");
+        Ok(WriterGuard {
+            storage,
+            mgr: self,
+            committed: false,
+        })
+    }
+
+    /// Database path managed by this pool.
+    pub fn db_path(&self) -> &Path {
+        &self.db_path
+    }
+
+    /// Number of reader connections in the pool.
+    pub fn reader_count(&self) -> usize {
+        self.readers.len()
+    }
+
+    /// Maximum concurrent writers allowed.
+    pub fn max_writers(&self) -> usize {
+        self.config.max_writers
+    }
+}
+
+/// RAII guard for a writer connection.
+///
+/// Provides access to a [`FrankenStorage`] for write operations.
+/// Releases the writer semaphore slot when dropped.
+pub struct WriterGuard<'a> {
+    storage: FrankenStorage,
+    mgr: &'a FrankenConnectionManager,
+    committed: bool,
+}
+
+impl<'a> WriterGuard<'a> {
+    /// Access the underlying storage for read/write operations.
+    pub fn storage(&self) -> &FrankenStorage {
+        &self.storage
+    }
+
+    /// Mark this writer as successfully committed.
+    ///
+    /// Call after your transaction's `commit()` succeeds. Prevents the drop
+    /// guard from attempting a rollback.
+    pub fn mark_committed(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for WriterGuard<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            // Best-effort rollback — connection may already be in autocommit
+            let _ = self.storage.raw().execute("ROLLBACK;");
+        }
+        // Release writer token
+        let _ = self.mgr.writer_tokens.0.send(());
+    }
+}
+
+// -------------------------------------------------------------------------
 // Binary Metadata Serialization (Opt 3.1)
 // -------------------------------------------------------------------------
 // MessagePack provides 50-70% storage reduction vs JSON and faster parsing.
@@ -196,10 +512,10 @@ fn franken_read_metadata_compat(
     bin_idx: usize,
 ) -> serde_json::Value {
     // Try binary column first (new format)
-    if let Ok(Some(bytes)) = row.get_typed::<Option<Vec<u8>>>(bin_idx) {
-        if !bytes.is_empty() {
-            return deserialize_msgpack_to_json(&bytes);
-        }
+    if let Ok(Some(bytes)) = row.get_typed::<Option<Vec<u8>>>(bin_idx)
+        && !bytes.is_empty()
+    {
+        return deserialize_msgpack_to_json(&bytes);
     }
 
     // Fall back to JSON column (old format or migration in progress)
@@ -1050,6 +1366,20 @@ impl FrankenStorage {
         Ok(storage)
     }
 
+    /// Open a writer connection that skips migration (assumes DB already migrated).
+    ///
+    /// Used by the BEGIN CONCURRENT parallel writer pool: each writer needs its
+    /// own connection with config applied, but migrations have already been run
+    /// by the primary connection.
+    pub fn open_writer(path: &Path) -> Result<Self> {
+        let path_str = path.to_string_lossy().to_string();
+        let conn = FrankenConnection::open(&path_str)
+            .with_context(|| format!("opening frankensqlite writer at {}", path.display()))?;
+        let storage = Self { conn };
+        storage.apply_config()?;
+        Ok(storage)
+    }
+
     /// Open in read-only mode using frankensqlite compat flags.
     ///
     /// Note: current frankensqlite compat `open_with_flags` is a façade and may
@@ -1111,6 +1441,10 @@ impl FrankenStorage {
         // wal_autocheckpoint: frankensqlite manages WAL internally, but the
         // PRAGMA is accepted for compatibility.
         let _ = self.conn.execute("PRAGMA wal_autocheckpoint = 1000;");
+        // Explicitly enable concurrent writer mode for BEGIN/transaction paths.
+        // Try both namespace variants for compatibility across fsqlite builds.
+        let _ = self.conn.execute("PRAGMA fsqlite.concurrent_mode = ON;");
+        let _ = self.conn.execute("PRAGMA concurrent_mode = ON;");
 
         Ok(())
     }
@@ -1163,10 +1497,10 @@ impl FrankenStorage {
             .query("SELECT MAX(version) FROM _schema_migrations;")
             .with_context(|| "reading schema version from _schema_migrations")?;
 
-        if let Some(row) = rows.first() {
-            if let Ok(v) = row.get_typed::<Option<i64>>(0) {
-                return Ok(v.unwrap_or(0));
-            }
+        if let Some(row) = rows.first()
+            && let Ok(v) = row.get_typed::<Option<i64>>(0)
+        {
+            return Ok(v.unwrap_or(0));
         }
         Ok(0)
     }
@@ -1191,6 +1525,106 @@ impl FrankenStorage {
             .with_context(|| "syncing meta schema_version")?;
 
         Ok(())
+    }
+
+    /// Resolve the database file path for this connection.
+    pub fn database_path(&self) -> Result<PathBuf> {
+        let rows = self.conn.query("PRAGMA database_list;")?;
+        for row in &rows {
+            if let Ok(name) = row.get_typed::<String>(1)
+                && name == "main"
+            {
+                let file_path: String = row.get_typed(2)?;
+                return Ok(PathBuf::from(file_path));
+            }
+        }
+        Err(anyhow!("could not resolve database file path"))
+    }
+
+    /// Open database with migration, backing up if schema is incompatible.
+    ///
+    /// Mirrors `SqliteStorage::open_or_rebuild` but uses frankensqlite.
+    pub fn open_or_rebuild(path: &Path) -> std::result::Result<Self, MigrationError> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        if path.exists() {
+            let check_result = franken_check_schema_compatibility(path);
+            match check_result {
+                Ok(SchemaCheck::Compatible) | Ok(SchemaCheck::NeedsMigration) => {
+                    // Continue with normal open
+                }
+                Ok(SchemaCheck::NeedsRebuild(reason)) => {
+                    let backup_path = create_backup(path)?;
+                    cleanup_old_backups(path, MAX_BACKUPS)?;
+                    remove_database_files(path)?;
+                    return Err(MigrationError::RebuildRequired {
+                        reason,
+                        backup_path,
+                    });
+                }
+                Err(_) => {
+                    let backup_path = create_backup(path)?;
+                    cleanup_old_backups(path, MAX_BACKUPS)?;
+                    remove_database_files(path)?;
+                    return Err(MigrationError::RebuildRequired {
+                        reason: "Database appears corrupted".to_string(),
+                        backup_path,
+                    });
+                }
+            }
+        }
+
+        let storage = Self::open(path).map_err(|e| MigrationError::Other(e.to_string()))?;
+        Ok(storage)
+    }
+}
+
+/// Check schema compatibility without modifying the database (frankensqlite version).
+fn franken_check_schema_compatibility(path: &Path) -> Result<SchemaCheck> {
+    let path_str = path.to_string_lossy().to_string();
+    let conn = FrankenConnection::open(&path_str)
+        .with_context(|| format!("opening db for schema check at {}", path.display()))?;
+
+    let meta_rows =
+        conn.query("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='meta'")?;
+    let meta_exists: i64 = meta_rows
+        .first()
+        .and_then(|r| r.get_typed::<i64>(0).ok())
+        .unwrap_or(0);
+
+    if meta_exists == 0 {
+        let table_rows = conn.query("SELECT COUNT(*) FROM sqlite_master WHERE type='table'")?;
+        let table_count: i64 = table_rows
+            .first()
+            .and_then(|r| r.get_typed::<i64>(0).ok())
+            .unwrap_or(0);
+
+        if table_count == 0 {
+            return Ok(SchemaCheck::NeedsMigration);
+        }
+        return Ok(SchemaCheck::NeedsRebuild(
+            "Database missing schema version metadata".to_string(),
+        ));
+    }
+
+    let version_rows = conn.query("SELECT value FROM meta WHERE key = 'schema_version'")?;
+    let version: Option<i64> = version_rows
+        .first()
+        .and_then(|r| r.get_typed::<String>(0).ok())
+        .and_then(|s| s.parse().ok());
+
+    match version {
+        Some(v) if v == SCHEMA_VERSION => Ok(SchemaCheck::Compatible),
+        Some(v) if v < SCHEMA_VERSION => Ok(SchemaCheck::NeedsMigration),
+        Some(v) => Ok(SchemaCheck::NeedsRebuild(format!(
+            "Schema version {} is newer than supported version {}",
+            v, SCHEMA_VERSION
+        ))),
+        None => Ok(SchemaCheck::NeedsRebuild(
+            "Schema version not found or invalid".to_string(),
+        )),
     }
 }
 
@@ -1655,9 +2089,7 @@ fn transition_from_meta_version(conn: &FrankenConnection) -> Result<()> {
     if current_version == 0 {
         // Check if tables actually exist (corrupted state: tables present but version=0).
         let rows = conn
-            .query(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name='conversations';",
-            )
+            .query("SELECT name FROM sqlite_master WHERE type='table' AND name='conversations';")
             .with_context(|| "checking for conversations table")?;
 
         if rows.is_empty() {
@@ -2040,10 +2472,9 @@ impl FrankenStorage {
         if id == LOCAL_SOURCE_ID {
             anyhow::bail!("cannot delete the local source");
         }
-        let count = self.conn.execute_params(
-            "DELETE FROM sources WHERE id = ?1",
-            fparams![id],
-        )?;
+        let count = self
+            .conn
+            .execute_params("DELETE FROM sources WHERE id = ?1", fparams![id])?;
         Ok(count > 0)
     }
 
@@ -2226,7 +2657,12 @@ impl FrankenStorage {
     }
 
     /// Create or update an embedding job.
-    pub fn upsert_embedding_job(&self, db_path: &str, model_id: &str, total_docs: i64) -> Result<i64> {
+    pub fn upsert_embedding_job(
+        &self,
+        db_path: &str,
+        model_id: &str,
+        total_docs: i64,
+    ) -> Result<i64> {
         self.conn.execute_params(
             "INSERT INTO embedding_jobs(db_path, model_id, total_docs) VALUES(?1,?2,?3)
              ON CONFLICT(db_path, model_id) WHERE status IN ('pending', 'running')
@@ -2234,10 +2670,7 @@ impl FrankenStorage {
             fparams![db_path, model_id, total_docs],
         )?;
         let rows = self.conn.query("SELECT last_insert_rowid();")?;
-        let id: i64 = rows
-            .first()
-            .and_then(|r| r.get_typed(0).ok())
-            .unwrap_or(0);
+        let id: i64 = rows.first().and_then(|r| r.get_typed(0).ok()).unwrap_or(0);
         Ok(id)
     }
 
@@ -2313,11 +2746,9 @@ impl FrankenStorage {
         // Check if we have materialized stats
         let stats_count: i64 = self
             .conn
-            .query_row_map(
-                "SELECT COUNT(*) FROM daily_stats",
-                fparams![],
-                |row| row.get_typed(0),
-            )
+            .query_row_map("SELECT COUNT(*) FROM daily_stats", fparams![], |row| {
+                row.get_typed(0)
+            })
             .unwrap_or(0);
 
         if stats_count == 0 {
@@ -2440,11 +2871,9 @@ impl FrankenStorage {
     pub fn daily_stats_health(&self) -> Result<DailyStatsHealth> {
         let row_count: i64 = self
             .conn
-            .query_row_map(
-                "SELECT COUNT(*) FROM daily_stats",
-                fparams![],
-                |row| row.get_typed(0),
-            )
+            .query_row_map("SELECT COUNT(*) FROM daily_stats", fparams![], |row| {
+                row.get_typed(0)
+            })
             .unwrap_or(0);
 
         let oldest_update: Option<i64> = self
@@ -2458,11 +2887,9 @@ impl FrankenStorage {
 
         let conversation_count: i64 = self
             .conn
-            .query_row_map(
-                "SELECT COUNT(*) FROM conversations",
-                fparams![],
-                |row| row.get_typed(0),
-            )
+            .query_row_map("SELECT COUNT(*) FROM conversations", fparams![], |row| {
+                row.get_typed(0)
+            })
             .unwrap_or(0);
 
         let materialized_total: i64 = self
@@ -2483,6 +2910,321 @@ impl FrankenStorage {
             materialized_total,
             drift: (conversation_count - materialized_total).abs(),
         })
+    }
+
+    /// Batch insert multiple conversations with full analytics (token usage,
+    /// message metrics, rollups).  Frankensqlite equivalent of
+    /// `SqliteStorage::insert_conversations_batched`.
+    pub fn insert_conversations_batched(
+        &self,
+        conversations: &[(i64, Option<i64>, &Conversation)],
+    ) -> Result<Vec<InsertOutcome>> {
+        if conversations.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let pricing_table = PricingTable::franken_load(&self.conn).unwrap_or_else(|e| {
+            tracing::warn!(target: "cass::analytics::pricing", error = %e, "failed to load pricing table");
+            PricingTable { entries: Vec::new() }
+        });
+        let mut pricing_diag = PricingDiagnostics::default();
+
+        let tx = self.conn.transaction()?;
+        let mut outcomes = Vec::with_capacity(conversations.len());
+        let mut fts_entries = Vec::new();
+        let mut stats = StatsAggregator::new();
+        let mut token_stats = TokenStatsAggregator::new();
+        let mut token_entries: Vec<TokenUsageEntry> = Vec::new();
+        let mut metrics_entries: Vec<MessageMetricsEntry> = Vec::new();
+        let mut rollup_agg = AnalyticsRollupAggregator::new();
+        let mut conv_ids_to_summarize: Vec<i64> = Vec::new();
+
+        for &(agent_id, workspace_id, conv) in conversations {
+            let conv_id = franken_insert_conversation(&tx, agent_id, workspace_id, conv)?;
+            let mut total_chars: i64 = 0;
+            let mut inserted_indices = Vec::with_capacity(conv.messages.len());
+
+            for msg in &conv.messages {
+                let msg_id = franken_insert_message(&tx, conv_id, msg)?;
+                franken_insert_snippets(&tx, msg_id, &msg.snippets)?;
+                fts_entries.push(FtsEntry::from_message(msg_id, msg, conv));
+                total_chars += msg.content.len() as i64;
+                inserted_indices.push(msg.idx);
+            }
+
+            let delta = StatsDelta {
+                session_count_delta: 1,
+                message_count_delta: conv.messages.len() as i64,
+                total_chars_delta: total_chars,
+            };
+
+            let day_id = conv
+                .started_at
+                .map(FrankenStorage::day_id_from_millis)
+                .unwrap_or(0);
+            stats.record_delta(
+                &conv.agent_slug,
+                &conv.source_id,
+                day_id,
+                delta.session_count_delta,
+                delta.message_count_delta,
+                delta.total_chars_delta,
+            );
+
+            // Extract token usage from newly inserted messages
+            let conv_day_id = day_id;
+            let mut session_model_family = String::from("unknown");
+            let mut has_any_tokens = false;
+
+            for msg in &conv.messages {
+                let role_s = role_str(&msg.role);
+                let usage = crate::connectors::extract_tokens_for_agent(
+                    &conv.agent_slug,
+                    &msg.extra_json,
+                    &msg.content,
+                    &role_s,
+                );
+
+                // Look up message_id from DB
+                let msg_rows = tx.query_with_params(
+                    "SELECT id FROM messages WHERE conversation_id = ?1 AND idx = ?2",
+                    &param_slice_to_values(fparams![conv_id, msg.idx]),
+                )?;
+                let msg_id: Option<i64> = msg_rows.first().and_then(|r| r.get_typed::<i64>(0).ok());
+
+                let Some(message_id) = msg_id else {
+                    continue;
+                };
+
+                let msg_ts = msg.created_at.or(conv.started_at).unwrap_or(0);
+                let msg_day_id = if msg_ts > 0 {
+                    FrankenStorage::day_id_from_millis(msg_ts)
+                } else {
+                    conv_day_id
+                };
+
+                let model_info = usage
+                    .model_name
+                    .as_deref()
+                    .map(crate::connectors::normalize_model);
+
+                let model_family = model_info
+                    .as_ref()
+                    .map(|i| i.family.clone())
+                    .unwrap_or_else(|| "unknown".into());
+                let model_tier = model_info
+                    .as_ref()
+                    .map(|i| i.tier.clone())
+                    .unwrap_or_else(|| "unknown".into());
+                let provider = usage
+                    .provider
+                    .clone()
+                    .or_else(|| model_info.as_ref().map(|i| i.provider.clone()))
+                    .unwrap_or_else(|| "unknown".into());
+
+                if model_family != "unknown" {
+                    session_model_family = model_family.clone();
+                }
+
+                let estimated_cost = pricing_table.compute_cost(
+                    usage.model_name.as_deref(),
+                    msg_day_id,
+                    usage.input_tokens,
+                    usage.output_tokens,
+                    usage.cache_read_tokens,
+                    usage.cache_creation_tokens,
+                );
+                if estimated_cost.is_some() {
+                    pricing_diag.record_priced();
+                } else if usage.has_token_data() {
+                    pricing_diag.record_unpriced(usage.model_name.as_deref());
+                }
+
+                token_stats.record(
+                    &conv.agent_slug,
+                    &conv.source_id,
+                    msg_day_id,
+                    &model_family,
+                    &role_s,
+                    &usage,
+                    msg.content.len() as i64,
+                    estimated_cost.unwrap_or(0.0),
+                );
+
+                if usage.has_token_data() {
+                    has_any_tokens = true;
+                }
+
+                let content_chars = msg.content.len() as i64;
+                let content_tokens_est = content_chars / 4;
+                let msg_hour_id = FrankenStorage::hour_id_from_millis(msg_ts);
+                let has_plan = has_plan_for_role(&role_s, &msg.content);
+
+                token_entries.push(TokenUsageEntry {
+                    message_id,
+                    conversation_id: conv_id,
+                    agent_id,
+                    workspace_id,
+                    source_id: conv.source_id.clone(),
+                    timestamp_ms: msg_ts,
+                    day_id: msg_day_id,
+                    model_name: usage.model_name.clone(),
+                    model_family: Some(model_family.clone()),
+                    model_tier: Some(model_tier.clone()),
+                    service_tier: usage.service_tier.clone(),
+                    provider: Some(provider.clone()),
+                    input_tokens: usage.input_tokens,
+                    output_tokens: usage.output_tokens,
+                    cache_read_tokens: usage.cache_read_tokens,
+                    cache_creation_tokens: usage.cache_creation_tokens,
+                    thinking_tokens: usage.thinking_tokens,
+                    total_tokens: usage.total_tokens(),
+                    estimated_cost_usd: estimated_cost,
+                    role: role_s.clone(),
+                    content_chars,
+                    has_tool_calls: usage.has_tool_calls,
+                    tool_call_count: usage.tool_call_count,
+                    data_source: usage.data_source.as_str().to_string(),
+                });
+
+                let mm = MessageMetricsEntry {
+                    message_id,
+                    created_at_ms: msg_ts,
+                    hour_id: msg_hour_id,
+                    day_id: msg_day_id,
+                    agent_slug: conv.agent_slug.clone(),
+                    workspace_id: workspace_id.unwrap_or(0),
+                    source_id: conv.source_id.clone(),
+                    role: role_s,
+                    content_chars,
+                    content_tokens_est,
+                    model_name: usage.model_name.clone(),
+                    model_family: model_family.clone(),
+                    model_tier: model_tier.clone(),
+                    provider,
+                    api_input_tokens: usage.input_tokens,
+                    api_output_tokens: usage.output_tokens,
+                    api_cache_read_tokens: usage.cache_read_tokens,
+                    api_cache_creation_tokens: usage.cache_creation_tokens,
+                    api_thinking_tokens: usage.thinking_tokens,
+                    api_service_tier: usage.service_tier.clone(),
+                    api_data_source: usage.data_source.as_str().to_string(),
+                    tool_call_count: usage.tool_call_count as i64,
+                    has_tool_calls: usage.has_tool_calls,
+                    has_plan,
+                };
+                rollup_agg.record(&mm);
+                metrics_entries.push(mm);
+            }
+
+            if delta.session_count_delta > 0 {
+                token_stats.record_session(
+                    &conv.agent_slug,
+                    &conv.source_id,
+                    conv_day_id,
+                    &session_model_family,
+                );
+            }
+
+            if has_any_tokens {
+                conv_ids_to_summarize.push(conv_id);
+            }
+
+            outcomes.push(InsertOutcome {
+                conversation_id: conv_id,
+                inserted_indices,
+            });
+        }
+
+        // Batch insert all FTS entries at once
+        let fts_count = fts_entries.len();
+        if fts_count > 0 {
+            let inserted = franken_batch_insert_fts(&tx, &fts_entries)?;
+            tracing::debug!(
+                target: "cass::perf::fts5",
+                total = fts_count,
+                inserted = inserted,
+                conversations = conversations.len(),
+                "franken_batch_fts_insert_complete"
+            );
+        }
+
+        // Batched daily_stats update
+        if !stats.is_empty() {
+            let entries = stats.expand();
+            let affected = franken_update_daily_stats_batched_in_tx(&tx, &entries)?;
+            tracing::debug!(
+                target: "cass::perf::daily_stats",
+                raw = stats.raw_entry_count(),
+                expanded = entries.len(),
+                affected = affected,
+                "franken_batched_stats_update_complete"
+            );
+        }
+
+        // Batch insert token_usage rows
+        if !token_entries.is_empty() {
+            let token_count = token_entries.len();
+            let inserted = franken_insert_token_usage_batched_in_tx(&tx, &token_entries)?;
+            tracing::debug!(
+                target: "cass::perf::token_usage",
+                total = token_count,
+                inserted = inserted,
+                "franken_batch_token_usage_insert_complete"
+            );
+        }
+
+        // Batched token_daily_stats update
+        if !token_stats.is_empty() {
+            let entries = token_stats.expand();
+            let affected = franken_update_token_daily_stats_batched_in_tx(&tx, &entries)?;
+            tracing::debug!(
+                target: "cass::perf::token_daily_stats",
+                raw = token_stats.raw_entry_count(),
+                expanded = entries.len(),
+                affected = affected,
+                "franken_batched_token_stats_update_complete"
+            );
+        }
+
+        // Batch insert message_metrics rows
+        if !metrics_entries.is_empty() {
+            let mm_count = metrics_entries.len();
+            let inserted = franken_insert_message_metrics_batched_in_tx(&tx, &metrics_entries)?;
+            tracing::debug!(
+                target: "cass::perf::message_metrics",
+                total = mm_count,
+                inserted = inserted,
+                "franken_batch_message_metrics_insert_complete"
+            );
+        }
+
+        // Flush usage_hourly + usage_daily rollups
+        if !rollup_agg.is_empty() {
+            let (hourly, daily, models_daily) =
+                franken_flush_analytics_rollups_in_tx(&tx, &rollup_agg)?;
+            tracing::debug!(
+                target: "cass::perf::usage_rollups",
+                hourly_buckets = rollup_agg.hourly_entry_count(),
+                daily_buckets = rollup_agg.daily_entry_count(),
+                models_daily_buckets = rollup_agg.models_daily_entry_count(),
+                hourly_affected = hourly,
+                daily_affected = daily,
+                models_daily_affected = models_daily,
+                "franken_batched_usage_rollups_complete"
+            );
+        }
+
+        // Update conversation-level token summaries
+        for conv_id in &conv_ids_to_summarize {
+            franken_update_conversation_token_summaries_in_tx(&tx, *conv_id)?;
+        }
+
+        tx.commit()?;
+
+        pricing_diag.log_summary();
+
+        Ok(outcomes)
     }
 }
 
@@ -2569,7 +3311,7 @@ fn franken_insert_snippets(
     snippets: &[Snippet],
 ) -> Result<()> {
     for snip in snippets {
-        let file_path_str = snip.file_path.as_ref().map(|p| path_to_string(p));
+        let file_path_str = snip.file_path.as_ref().map(path_to_string);
         tx.execute_params(
             "INSERT INTO snippets(message_id, file_path, start_line, end_line, language, snippet_text)
              VALUES(?1,?2,?3,?4,?5,?6)",
@@ -2587,10 +3329,7 @@ fn franken_insert_snippets(
 }
 
 /// Batch insert FTS5 entries within a frankensqlite transaction.
-fn franken_batch_insert_fts(
-    tx: &FrankenTransaction<'_>,
-    entries: &[FtsEntry],
-) -> Result<usize> {
+fn franken_batch_insert_fts(tx: &FrankenTransaction<'_>, entries: &[FtsEntry]) -> Result<usize> {
     if entries.is_empty() {
         return Ok(0);
     }
@@ -2705,6 +3444,491 @@ fn franken_update_daily_stats_in_tx(
     Ok(())
 }
 
+// -------------------------------------------------------------------------
+// Frankensqlite batch helpers (migration from rusqlite `_in_tx` functions)
+// -------------------------------------------------------------------------
+
+/// Batch upsert daily_stats within a frankensqlite transaction.
+fn franken_update_daily_stats_batched_in_tx(
+    tx: &FrankenTransaction<'_>,
+    entries: &[(i64, String, String, StatsDelta)],
+) -> Result<usize> {
+    if entries.is_empty() {
+        return Ok(0);
+    }
+
+    let now = FrankenStorage::now_millis();
+    const BATCH_SIZE: usize = 100;
+    let mut total_affected = 0;
+
+    for chunk in entries.chunks(BATCH_SIZE) {
+        let placeholders: String = (0..chunk.len())
+            .map(|_| "(?, ?, ?, ?, ?, ?, ?)")
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let sql = format!(
+            "INSERT INTO daily_stats (day_id, agent_slug, source_id, session_count, message_count, total_chars, last_updated)
+             VALUES {}
+             ON CONFLICT(day_id, agent_slug, source_id) DO UPDATE SET
+                 session_count = session_count + excluded.session_count,
+                 message_count = message_count + excluded.message_count,
+                 total_chars = total_chars + excluded.total_chars,
+                 last_updated = excluded.last_updated",
+            placeholders
+        );
+
+        let mut params_vec: Vec<ParamValue> = Vec::with_capacity(chunk.len() * 7);
+        for (day_id, agent, source, delta) in chunk {
+            params_vec.push(ParamValue::from(*day_id));
+            params_vec.push(ParamValue::from(agent.clone()));
+            params_vec.push(ParamValue::from(source.clone()));
+            params_vec.push(ParamValue::from(delta.session_count_delta));
+            params_vec.push(ParamValue::from(delta.message_count_delta));
+            params_vec.push(ParamValue::from(delta.total_chars_delta));
+            params_vec.push(ParamValue::from(now));
+        }
+
+        let values = param_slice_to_values(&params_vec);
+        total_affected += tx.execute_with_params(&sql, &values)?;
+    }
+
+    Ok(total_affected)
+}
+
+/// Batch insert token_usage rows within a frankensqlite transaction.
+fn franken_insert_token_usage_batched_in_tx(
+    tx: &FrankenTransaction<'_>,
+    entries: &[TokenUsageEntry],
+) -> Result<usize> {
+    if entries.is_empty() {
+        return Ok(0);
+    }
+
+    // 24 columns per row; SQLite limit ~999 params → batch ~41 rows, use 35 for safety
+    const BATCH_SIZE: usize = 35;
+    let mut total_inserted = 0;
+
+    for chunk in entries.chunks(BATCH_SIZE) {
+        let placeholders: String = (0..chunk.len())
+            .map(|_| "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let sql = format!(
+            "INSERT OR IGNORE INTO token_usage (
+                message_id, conversation_id, agent_id, workspace_id, source_id,
+                timestamp_ms, day_id,
+                model_name, model_family, model_tier, service_tier, provider,
+                input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
+                thinking_tokens, total_tokens, estimated_cost_usd,
+                role, content_chars, has_tool_calls, tool_call_count, data_source
+            )
+            VALUES {}",
+            placeholders
+        );
+
+        let mut params_vec: Vec<ParamValue> = Vec::with_capacity(chunk.len() * 24);
+        for e in chunk {
+            params_vec.push(ParamValue::from(e.message_id));
+            params_vec.push(ParamValue::from(e.conversation_id));
+            params_vec.push(ParamValue::from(e.agent_id));
+            params_vec.push(ParamValue::from(e.workspace_id));
+            params_vec.push(ParamValue::from(e.source_id.clone()));
+            params_vec.push(ParamValue::from(e.timestamp_ms));
+            params_vec.push(ParamValue::from(e.day_id));
+            params_vec.push(ParamValue::from(e.model_name.clone()));
+            params_vec.push(ParamValue::from(e.model_family.clone()));
+            params_vec.push(ParamValue::from(e.model_tier.clone()));
+            params_vec.push(ParamValue::from(e.service_tier.clone()));
+            params_vec.push(ParamValue::from(e.provider.clone()));
+            params_vec.push(ParamValue::from(e.input_tokens));
+            params_vec.push(ParamValue::from(e.output_tokens));
+            params_vec.push(ParamValue::from(e.cache_read_tokens));
+            params_vec.push(ParamValue::from(e.cache_creation_tokens));
+            params_vec.push(ParamValue::from(e.thinking_tokens));
+            params_vec.push(ParamValue::from(e.total_tokens));
+            params_vec.push(ParamValue::from(e.estimated_cost_usd));
+            params_vec.push(ParamValue::from(e.role.clone()));
+            params_vec.push(ParamValue::from(e.content_chars));
+            params_vec.push(ParamValue::from(e.has_tool_calls as i64));
+            params_vec.push(ParamValue::from(e.tool_call_count as i64));
+            params_vec.push(ParamValue::from(e.data_source.clone()));
+        }
+
+        let values = param_slice_to_values(&params_vec);
+        total_inserted += tx.execute_with_params(&sql, &values)?;
+    }
+
+    Ok(total_inserted)
+}
+
+/// Batch upsert token_daily_stats within a frankensqlite transaction.
+fn franken_update_token_daily_stats_batched_in_tx(
+    tx: &FrankenTransaction<'_>,
+    entries: &[(i64, String, String, String, TokenStatsDelta)],
+) -> Result<usize> {
+    if entries.is_empty() {
+        return Ok(0);
+    }
+
+    let now = FrankenStorage::now_millis();
+    const BATCH_SIZE: usize = 25; // 19 params per row → ~52 rows max, use 25 for safety
+
+    let mut total_affected = 0;
+
+    for chunk in entries.chunks(BATCH_SIZE) {
+        let placeholders: String = (0..chunk.len())
+            .map(|_| "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let sql = format!(
+            "INSERT INTO token_daily_stats (
+                day_id, agent_slug, source_id, model_family,
+                api_call_count, user_message_count, assistant_message_count, tool_message_count,
+                total_input_tokens, total_output_tokens, total_cache_read_tokens,
+                total_cache_creation_tokens, total_thinking_tokens, grand_total_tokens,
+                total_content_chars, total_tool_calls, estimated_cost_usd, session_count,
+                last_updated
+            )
+            VALUES {}
+            ON CONFLICT(day_id, agent_slug, source_id, model_family) DO UPDATE SET
+                api_call_count = api_call_count + excluded.api_call_count,
+                user_message_count = user_message_count + excluded.user_message_count,
+                assistant_message_count = assistant_message_count + excluded.assistant_message_count,
+                tool_message_count = tool_message_count + excluded.tool_message_count,
+                total_input_tokens = total_input_tokens + excluded.total_input_tokens,
+                total_output_tokens = total_output_tokens + excluded.total_output_tokens,
+                total_cache_read_tokens = total_cache_read_tokens + excluded.total_cache_read_tokens,
+                total_cache_creation_tokens = total_cache_creation_tokens + excluded.total_cache_creation_tokens,
+                total_thinking_tokens = total_thinking_tokens + excluded.total_thinking_tokens,
+                grand_total_tokens = grand_total_tokens + excluded.grand_total_tokens,
+                total_content_chars = total_content_chars + excluded.total_content_chars,
+                total_tool_calls = total_tool_calls + excluded.total_tool_calls,
+                estimated_cost_usd = estimated_cost_usd + excluded.estimated_cost_usd,
+                session_count = session_count + excluded.session_count,
+                last_updated = excluded.last_updated",
+            placeholders
+        );
+
+        let mut params_vec: Vec<ParamValue> = Vec::with_capacity(chunk.len() * 19);
+        for (day_id, agent, source, model, delta) in chunk {
+            params_vec.push(ParamValue::from(*day_id));
+            params_vec.push(ParamValue::from(agent.clone()));
+            params_vec.push(ParamValue::from(source.clone()));
+            params_vec.push(ParamValue::from(model.clone()));
+            params_vec.push(ParamValue::from(delta.api_call_count));
+            params_vec.push(ParamValue::from(delta.user_message_count));
+            params_vec.push(ParamValue::from(delta.assistant_message_count));
+            params_vec.push(ParamValue::from(delta.tool_message_count));
+            params_vec.push(ParamValue::from(delta.total_input_tokens));
+            params_vec.push(ParamValue::from(delta.total_output_tokens));
+            params_vec.push(ParamValue::from(delta.total_cache_read_tokens));
+            params_vec.push(ParamValue::from(delta.total_cache_creation_tokens));
+            params_vec.push(ParamValue::from(delta.total_thinking_tokens));
+            params_vec.push(ParamValue::from(delta.grand_total_tokens));
+            params_vec.push(ParamValue::from(delta.total_content_chars));
+            params_vec.push(ParamValue::from(delta.total_tool_calls));
+            params_vec.push(ParamValue::from(delta.estimated_cost_usd));
+            params_vec.push(ParamValue::from(delta.session_count));
+            params_vec.push(ParamValue::from(now));
+        }
+
+        let values = param_slice_to_values(&params_vec);
+        total_affected += tx.execute_with_params(&sql, &values)?;
+    }
+
+    Ok(total_affected)
+}
+
+/// Batch insert message_metrics rows within a frankensqlite transaction.
+fn franken_insert_message_metrics_batched_in_tx(
+    tx: &FrankenTransaction<'_>,
+    entries: &[MessageMetricsEntry],
+) -> Result<usize> {
+    if entries.is_empty() {
+        return Ok(0);
+    }
+
+    // 24 columns per row → ~41 rows max, use 30 for safety
+    const BATCH_SIZE: usize = 30;
+    let mut total_inserted = 0;
+
+    for chunk in entries.chunks(BATCH_SIZE) {
+        let placeholders: String = (0..chunk.len())
+            .map(|_| "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let sql = format!(
+            "INSERT OR IGNORE INTO message_metrics (
+                message_id, created_at_ms, hour_id, day_id,
+                agent_slug, workspace_id, source_id, role,
+                content_chars, content_tokens_est,
+                model_name, model_family, model_tier, provider,
+                api_input_tokens, api_output_tokens, api_cache_read_tokens,
+                api_cache_creation_tokens, api_thinking_tokens,
+                api_service_tier, api_data_source,
+                tool_call_count, has_tool_calls, has_plan
+            )
+            VALUES {}",
+            placeholders
+        );
+
+        let mut params_vec: Vec<ParamValue> = Vec::with_capacity(chunk.len() * 24);
+        for e in chunk {
+            params_vec.push(ParamValue::from(e.message_id));
+            params_vec.push(ParamValue::from(e.created_at_ms));
+            params_vec.push(ParamValue::from(e.hour_id));
+            params_vec.push(ParamValue::from(e.day_id));
+            params_vec.push(ParamValue::from(e.agent_slug.clone()));
+            params_vec.push(ParamValue::from(e.workspace_id));
+            params_vec.push(ParamValue::from(e.source_id.clone()));
+            params_vec.push(ParamValue::from(e.role.clone()));
+            params_vec.push(ParamValue::from(e.content_chars));
+            params_vec.push(ParamValue::from(e.content_tokens_est));
+            params_vec.push(ParamValue::from(e.model_name.clone()));
+            params_vec.push(ParamValue::from(e.model_family.clone()));
+            params_vec.push(ParamValue::from(e.model_tier.clone()));
+            params_vec.push(ParamValue::from(e.provider.clone()));
+            params_vec.push(ParamValue::from(e.api_input_tokens));
+            params_vec.push(ParamValue::from(e.api_output_tokens));
+            params_vec.push(ParamValue::from(e.api_cache_read_tokens));
+            params_vec.push(ParamValue::from(e.api_cache_creation_tokens));
+            params_vec.push(ParamValue::from(e.api_thinking_tokens));
+            params_vec.push(ParamValue::from(e.api_service_tier.clone()));
+            params_vec.push(ParamValue::from(e.api_data_source.clone()));
+            params_vec.push(ParamValue::from(e.tool_call_count));
+            params_vec.push(ParamValue::from(e.has_tool_calls as i64));
+            params_vec.push(ParamValue::from(e.has_plan as i64));
+        }
+
+        let values = param_slice_to_values(&params_vec);
+        total_inserted += tx.execute_with_params(&sql, &values)?;
+    }
+
+    Ok(total_inserted)
+}
+
+/// Flush one rollup table (shared logic for hourly + daily) within a frankensqlite transaction.
+fn franken_flush_rollup_table(
+    tx: &FrankenTransaction<'_>,
+    table: &str,
+    bucket_col: &str,
+    deltas: &HashMap<(i64, String, i64, String), UsageRollupDelta>,
+    now: i64,
+) -> Result<usize> {
+    if deltas.is_empty() {
+        return Ok(0);
+    }
+
+    // 22 params per row → ~44 rows max, use 30 for safety
+    const BATCH_SIZE: usize = 30;
+    let mut total_affected = 0;
+
+    let entries: Vec<_> = deltas.iter().collect();
+
+    for chunk in entries.chunks(BATCH_SIZE) {
+        let placeholders: String = (0..chunk.len())
+            .map(|_| "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let sql = format!(
+            "INSERT INTO {table} (
+                {bucket_col}, agent_slug, workspace_id, source_id,
+                message_count, user_message_count, assistant_message_count,
+                tool_call_count, plan_message_count, plan_content_tokens_est_total,
+                plan_api_tokens_total, api_coverage_message_count,
+                content_tokens_est_total, content_tokens_est_user, content_tokens_est_assistant,
+                api_tokens_total, api_input_tokens_total, api_output_tokens_total,
+                api_cache_read_tokens_total, api_cache_creation_tokens_total,
+                api_thinking_tokens_total, last_updated
+            )
+            VALUES {placeholders}
+            ON CONFLICT({bucket_col}, agent_slug, workspace_id, source_id) DO UPDATE SET
+                message_count = message_count + excluded.message_count,
+                user_message_count = user_message_count + excluded.user_message_count,
+                assistant_message_count = assistant_message_count + excluded.assistant_message_count,
+                tool_call_count = tool_call_count + excluded.tool_call_count,
+                plan_message_count = plan_message_count + excluded.plan_message_count,
+                plan_content_tokens_est_total = plan_content_tokens_est_total + excluded.plan_content_tokens_est_total,
+                plan_api_tokens_total = plan_api_tokens_total + excluded.plan_api_tokens_total,
+                api_coverage_message_count = api_coverage_message_count + excluded.api_coverage_message_count,
+                content_tokens_est_total = content_tokens_est_total + excluded.content_tokens_est_total,
+                content_tokens_est_user = content_tokens_est_user + excluded.content_tokens_est_user,
+                content_tokens_est_assistant = content_tokens_est_assistant + excluded.content_tokens_est_assistant,
+                api_tokens_total = api_tokens_total + excluded.api_tokens_total,
+                api_input_tokens_total = api_input_tokens_total + excluded.api_input_tokens_total,
+                api_output_tokens_total = api_output_tokens_total + excluded.api_output_tokens_total,
+                api_cache_read_tokens_total = api_cache_read_tokens_total + excluded.api_cache_read_tokens_total,
+                api_cache_creation_tokens_total = api_cache_creation_tokens_total + excluded.api_cache_creation_tokens_total,
+                api_thinking_tokens_total = api_thinking_tokens_total + excluded.api_thinking_tokens_total,
+                last_updated = excluded.last_updated"
+        );
+
+        let mut params_vec: Vec<ParamValue> = Vec::with_capacity(chunk.len() * 22);
+        for &((bucket_id, agent, workspace_id, source), d) in chunk {
+            params_vec.push(ParamValue::from(*bucket_id));
+            params_vec.push(ParamValue::from(agent.clone()));
+            params_vec.push(ParamValue::from(*workspace_id));
+            params_vec.push(ParamValue::from(source.clone()));
+            params_vec.push(ParamValue::from(d.message_count));
+            params_vec.push(ParamValue::from(d.user_message_count));
+            params_vec.push(ParamValue::from(d.assistant_message_count));
+            params_vec.push(ParamValue::from(d.tool_call_count));
+            params_vec.push(ParamValue::from(d.plan_message_count));
+            params_vec.push(ParamValue::from(d.plan_content_tokens_est_total));
+            params_vec.push(ParamValue::from(d.plan_api_tokens_total));
+            params_vec.push(ParamValue::from(d.api_coverage_message_count));
+            params_vec.push(ParamValue::from(d.content_tokens_est_total));
+            params_vec.push(ParamValue::from(d.content_tokens_est_user));
+            params_vec.push(ParamValue::from(d.content_tokens_est_assistant));
+            params_vec.push(ParamValue::from(d.api_tokens_total));
+            params_vec.push(ParamValue::from(d.api_input_tokens_total));
+            params_vec.push(ParamValue::from(d.api_output_tokens_total));
+            params_vec.push(ParamValue::from(d.api_cache_read_tokens_total));
+            params_vec.push(ParamValue::from(d.api_cache_creation_tokens_total));
+            params_vec.push(ParamValue::from(d.api_thinking_tokens_total));
+            params_vec.push(ParamValue::from(now));
+        }
+
+        let values = param_slice_to_values(&params_vec);
+        total_affected += tx.execute_with_params(&sql, &values)?;
+    }
+
+    Ok(total_affected)
+}
+
+/// Flush usage_models_daily rollup within a frankensqlite transaction.
+fn franken_flush_model_daily_rollup_table(
+    tx: &FrankenTransaction<'_>,
+    deltas: &HashMap<(i64, String, i64, String, String, String), UsageRollupDelta>,
+    now: i64,
+) -> Result<usize> {
+    if deltas.is_empty() {
+        return Ok(0);
+    }
+
+    const BATCH_SIZE: usize = 25;
+    let mut total_affected = 0;
+
+    let entries: Vec<_> = deltas.iter().collect();
+
+    for chunk in entries.chunks(BATCH_SIZE) {
+        let placeholders: String = (0..chunk.len())
+            .map(|_| "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let sql = format!(
+            "INSERT INTO usage_models_daily (
+                day_id, agent_slug, workspace_id, source_id, model_family, model_tier,
+                message_count, user_message_count, assistant_message_count,
+                tool_call_count, plan_message_count, api_coverage_message_count,
+                content_tokens_est_total, content_tokens_est_user, content_tokens_est_assistant,
+                api_tokens_total, api_input_tokens_total, api_output_tokens_total,
+                api_cache_read_tokens_total, api_cache_creation_tokens_total,
+                api_thinking_tokens_total, last_updated
+            )
+            VALUES {placeholders}
+            ON CONFLICT(day_id, agent_slug, workspace_id, source_id, model_family, model_tier) DO UPDATE SET
+                message_count = message_count + excluded.message_count,
+                user_message_count = user_message_count + excluded.user_message_count,
+                assistant_message_count = assistant_message_count + excluded.assistant_message_count,
+                tool_call_count = tool_call_count + excluded.tool_call_count,
+                plan_message_count = plan_message_count + excluded.plan_message_count,
+                api_coverage_message_count = api_coverage_message_count + excluded.api_coverage_message_count,
+                content_tokens_est_total = content_tokens_est_total + excluded.content_tokens_est_total,
+                content_tokens_est_user = content_tokens_est_user + excluded.content_tokens_est_user,
+                content_tokens_est_assistant = content_tokens_est_assistant + excluded.content_tokens_est_assistant,
+                api_tokens_total = api_tokens_total + excluded.api_tokens_total,
+                api_input_tokens_total = api_input_tokens_total + excluded.api_input_tokens_total,
+                api_output_tokens_total = api_output_tokens_total + excluded.api_output_tokens_total,
+                api_cache_read_tokens_total = api_cache_read_tokens_total + excluded.api_cache_read_tokens_total,
+                api_cache_creation_tokens_total = api_cache_creation_tokens_total + excluded.api_cache_creation_tokens_total,
+                api_thinking_tokens_total = api_thinking_tokens_total + excluded.api_thinking_tokens_total,
+                last_updated = excluded.last_updated"
+        );
+
+        let mut params_vec: Vec<ParamValue> = Vec::with_capacity(chunk.len() * 22);
+        for &((day_id, agent, workspace_id, source, model_family, model_tier), d) in chunk {
+            params_vec.push(ParamValue::from(*day_id));
+            params_vec.push(ParamValue::from(agent.clone()));
+            params_vec.push(ParamValue::from(*workspace_id));
+            params_vec.push(ParamValue::from(source.clone()));
+            params_vec.push(ParamValue::from(model_family.clone()));
+            params_vec.push(ParamValue::from(model_tier.clone()));
+            params_vec.push(ParamValue::from(d.message_count));
+            params_vec.push(ParamValue::from(d.user_message_count));
+            params_vec.push(ParamValue::from(d.assistant_message_count));
+            params_vec.push(ParamValue::from(d.tool_call_count));
+            params_vec.push(ParamValue::from(d.plan_message_count));
+            params_vec.push(ParamValue::from(d.api_coverage_message_count));
+            params_vec.push(ParamValue::from(d.content_tokens_est_total));
+            params_vec.push(ParamValue::from(d.content_tokens_est_user));
+            params_vec.push(ParamValue::from(d.content_tokens_est_assistant));
+            params_vec.push(ParamValue::from(d.api_tokens_total));
+            params_vec.push(ParamValue::from(d.api_input_tokens_total));
+            params_vec.push(ParamValue::from(d.api_output_tokens_total));
+            params_vec.push(ParamValue::from(d.api_cache_read_tokens_total));
+            params_vec.push(ParamValue::from(d.api_cache_creation_tokens_total));
+            params_vec.push(ParamValue::from(d.api_thinking_tokens_total));
+            params_vec.push(ParamValue::from(now));
+        }
+
+        let values = param_slice_to_values(&params_vec);
+        total_affected += tx.execute_with_params(&sql, &values)?;
+    }
+
+    Ok(total_affected)
+}
+
+/// Flush AnalyticsRollupAggregator deltas via frankensqlite transaction.
+fn franken_flush_analytics_rollups_in_tx(
+    tx: &FrankenTransaction<'_>,
+    agg: &AnalyticsRollupAggregator,
+) -> Result<(usize, usize, usize)> {
+    let now = FrankenStorage::now_millis();
+
+    let hourly_affected =
+        franken_flush_rollup_table(tx, "usage_hourly", "hour_id", &agg.hourly, now)?;
+    let daily_affected = franken_flush_rollup_table(tx, "usage_daily", "day_id", &agg.daily, now)?;
+    let models_daily_affected = franken_flush_model_daily_rollup_table(tx, &agg.models_daily, now)?;
+
+    Ok((hourly_affected, daily_affected, models_daily_affected))
+}
+
+/// Update conversation-level token summary columns via frankensqlite transaction.
+fn franken_update_conversation_token_summaries_in_tx(
+    tx: &FrankenTransaction<'_>,
+    conversation_id: i64,
+) -> Result<()> {
+    tx.execute_params(
+        "UPDATE conversations SET
+            total_input_tokens = (SELECT SUM(input_tokens) FROM token_usage WHERE conversation_id = ?1),
+            total_output_tokens = (SELECT SUM(output_tokens) FROM token_usage WHERE conversation_id = ?1),
+            total_cache_read_tokens = (SELECT SUM(cache_read_tokens) FROM token_usage WHERE conversation_id = ?1),
+            total_cache_creation_tokens = (SELECT SUM(cache_creation_tokens) FROM token_usage WHERE conversation_id = ?1),
+            grand_total_tokens = (SELECT SUM(total_tokens) FROM token_usage WHERE conversation_id = ?1),
+            estimated_cost_usd = (SELECT SUM(estimated_cost_usd) FROM token_usage WHERE conversation_id = ?1),
+            primary_model = (SELECT model_name FROM token_usage WHERE conversation_id = ?1
+                             AND model_name IS NOT NULL
+                             GROUP BY model_name ORDER BY COUNT(*) DESC LIMIT 1),
+            api_call_count = (SELECT COUNT(*) FROM token_usage WHERE conversation_id = ?1
+                              AND data_source = 'api'),
+            tool_call_count = (SELECT SUM(tool_call_count) FROM token_usage WHERE conversation_id = ?1),
+            user_message_count = (SELECT COUNT(*) FROM token_usage WHERE conversation_id = ?1
+                                  AND role = 'user'),
+            assistant_message_count = (SELECT COUNT(*) FROM token_usage WHERE conversation_id = ?1
+                                       AND role IN ('assistant', 'agent'))
+         WHERE id = ?1",
+        fparams![conversation_id],
+    )?;
+    Ok(())
+}
+
 impl SqliteStorage {
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
@@ -2799,6 +4023,20 @@ impl SqliteStorage {
 
     pub fn raw(&self) -> &Connection {
         &self.conn
+    }
+
+    /// Resolve the primary SQLite database path for this connection.
+    ///
+    /// Uses `PRAGMA database_list` and returns the filename for `main`.
+    pub fn database_path(&self) -> Result<PathBuf> {
+        let path: String = self
+            .conn
+            .query_row("PRAGMA database_list", [], |row| row.get(2))
+            .with_context(|| "reading sqlite database path from PRAGMA database_list")?;
+        if path.is_empty() {
+            anyhow::bail!("sqlite main database path is empty (likely in-memory)");
+        }
+        Ok(PathBuf::from(path))
     }
 
     pub fn schema_version(&self) -> Result<i64> {
@@ -3678,6 +4916,31 @@ impl PricingTable {
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(Self { entries })
+    }
+
+    /// Load all pricing entries from a frankensqlite connection.
+    pub fn franken_load(conn: &FrankenConnection) -> Result<Self> {
+        let rows = conn.query(
+            "SELECT model_pattern, provider, input_cost_per_mtok, output_cost_per_mtok,
+                    cache_read_cost_per_mtok, cache_creation_cost_per_mtok, effective_date
+             FROM model_pricing
+             ORDER BY effective_date DESC",
+        )?;
+        let mut entries = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let effective_date: String = row.get_typed(6)?;
+            let effective_day_id = date_str_to_day_id(&effective_date);
+            entries.push(PricingEntry {
+                model_pattern: row.get_typed(0)?,
+                provider: row.get_typed(1)?,
+                input_cost_per_mtok: row.get_typed(2)?,
+                output_cost_per_mtok: row.get_typed(3)?,
+                cache_read_cost_per_mtok: row.get_typed(4)?,
+                cache_creation_cost_per_mtok: row.get_typed(5)?,
+                effective_day_id,
+            });
+        }
         Ok(Self { entries })
     }
 
@@ -4772,34 +6035,32 @@ impl SqliteStorage {
         let mut sql = "SELECT COUNT(*) FROM conversations c
                        JOIN agents a ON c.agent_id = a.id WHERE 1=1"
             .to_string();
-        let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        let mut params_vec: Vec<rusqlite::types::Value> = Vec::new();
 
         if let Some(start) = start_ts_ms {
             sql.push_str(" AND c.started_at >= ?");
-            params_vec.push(Box::new(start));
+            params_vec.push(start.into());
         }
         if let Some(end) = end_ts_ms {
             sql.push_str(" AND c.started_at <= ?");
-            params_vec.push(Box::new(end));
+            params_vec.push(end.into());
         }
         if let Some(agent) = agent_slug
             && agent != "all"
         {
             sql.push_str(" AND a.slug = ?");
-            params_vec.push(Box::new(agent.to_string()));
+            params_vec.push(agent.to_string().into());
         }
         if let Some(source) = source_id
             && source != "all"
         {
             sql.push_str(" AND c.source_id = ?");
-            params_vec.push(Box::new(source.to_string()));
+            params_vec.push(source.to_string().into());
         }
 
-        let params_refs: Vec<&dyn rusqlite::ToSql> =
-            params_vec.iter().map(|b| b.as_ref()).collect();
-        let count: i64 = self
-            .conn
-            .query_row(&sql, params_refs.as_slice(), |r| r.get(0))?;
+        let count: i64 =
+            self.conn
+                .query_row(&sql, rusqlite::params_from_iter(params_vec), |r| r.get(0))?;
         Ok((count, false))
     }
 
@@ -5894,18 +7155,18 @@ fn batch_insert_fts_messages(tx: &Transaction<'_>, entries: &[FtsEntry]) -> Resu
 
         // Flatten parameters
         // Capacity: chunk.len() * 7
-        let mut params_refs: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 7);
+        let mut params_vec: Vec<rusqlite::types::Value> = Vec::with_capacity(chunk.len() * 7);
         for entry in chunk {
-            params_refs.push(&entry.content);
-            params_refs.push(&entry.title);
-            params_refs.push(&entry.agent);
-            params_refs.push(&entry.workspace);
-            params_refs.push(&entry.source_path);
-            params_refs.push(&entry.created_at);
-            params_refs.push(&entry.message_id);
+            params_vec.push(entry.content.clone().into());
+            params_vec.push(entry.title.clone().into());
+            params_vec.push(entry.agent.clone().into());
+            params_vec.push(entry.workspace.clone().into());
+            params_vec.push(entry.source_path.clone().into());
+            params_vec.push(entry.created_at.into());
+            params_vec.push(entry.message_id.into());
         }
 
-        if let Err(e) = tx.execute(&sql, params_refs.as_slice()) {
+        if let Err(e) = tx.execute(&sql, rusqlite::params_from_iter(params_vec)) {
             // FTS is best-effort; log and continue
             tracing::debug!(
                 batch_size = chunk.len(),
@@ -8626,7 +9887,10 @@ mod tests {
         }
 
         // V4 sources table.
-        assert!(table_names.contains(&"sources".to_string()), "missing sources table");
+        assert!(
+            table_names.contains(&"sources".to_string()),
+            "missing sources table"
+        );
 
         // V8 daily_stats table.
         assert!(
@@ -8654,7 +9918,10 @@ mod tests {
             .query("SELECT COUNT(*) FROM _schema_migrations;")
             .unwrap();
         let count: i64 = rows.first().unwrap().get_typed(0).unwrap();
-        assert_eq!(count, 1, "_schema_migrations should have 1 entry (combined V13)");
+        assert_eq!(
+            count, 1,
+            "_schema_migrations should have 1 entry (combined V13)"
+        );
 
         // The single entry should be version 13.
         let rows = storage
@@ -8735,17 +10002,21 @@ mod tests {
         conn.execute(
             "CREATE TABLE _schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL DEFAULT 'now');",
         ).unwrap();
-        conn.execute(
-            "INSERT INTO _schema_migrations (version, name) VALUES (1, 'test');",
-        ).unwrap();
+        conn.execute("INSERT INTO _schema_migrations (version, name) VALUES (1, 'test');")
+            .unwrap();
 
         // Transition should be a no-op.
         transition_from_meta_version(&conn).unwrap();
 
         // Should still have exactly 1 entry.
-        let rows = conn.query("SELECT COUNT(*) FROM _schema_migrations;").unwrap();
+        let rows = conn
+            .query("SELECT COUNT(*) FROM _schema_migrations;")
+            .unwrap();
         let count: i64 = rows.first().unwrap().get_typed(0).unwrap();
-        assert_eq!(count, 1, "transition should not re-run on already-transitioned DB");
+        assert_eq!(
+            count, 1,
+            "transition should not re-run on already-transitioned DB"
+        );
     }
 
     #[test]
@@ -8759,9 +10030,14 @@ mod tests {
 
         // _schema_migrations should NOT have been created.
         let rows = conn
-            .query("SELECT name FROM sqlite_master WHERE type='table' AND name='_schema_migrations';")
+            .query(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='_schema_migrations';",
+            )
             .unwrap();
-        assert!(rows.is_empty(), "transition should not create _schema_migrations on fresh DB");
+        assert!(
+            rows.is_empty(),
+            "transition should not create _schema_migrations on fresh DB"
+        );
     }
 
     #[test]
@@ -8773,5 +10049,152 @@ mod tests {
         assert!(result.was_fresh);
         assert_eq!(result.applied, vec![13], "should apply combined V13");
         assert_eq!(result.current, 13);
+    }
+
+    // =========================================================================
+    // FrankenConnectionManager tests (bead 3rlf8)
+    // =========================================================================
+
+    #[test]
+    fn connection_manager_creates_readers() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("cm.db");
+
+        // Create the DB first
+        let fs = FrankenStorage::open(&db_path).unwrap();
+        drop(fs);
+
+        let config = ConnectionManagerConfig {
+            reader_count: 3,
+            max_writers: 2,
+        };
+        let mgr = FrankenConnectionManager::new(&db_path, config).unwrap();
+        assert_eq!(mgr.reader_count(), 3);
+        assert_eq!(mgr.max_writers(), 2);
+    }
+
+    #[test]
+    fn connection_manager_reader_round_robin() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("cm.db");
+
+        let fs = FrankenStorage::open(&db_path).unwrap();
+        drop(fs);
+
+        let config = ConnectionManagerConfig {
+            reader_count: 2,
+            max_writers: 1,
+        };
+        let mgr = FrankenConnectionManager::new(&db_path, config).unwrap();
+
+        // Reader index should advance (round-robin)
+        let idx_before = mgr.reader_idx.load(std::sync::atomic::Ordering::Relaxed);
+        let _r1 = mgr.reader();
+        let idx_after = mgr.reader_idx.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(idx_after, idx_before + 1, "reader index should advance");
+    }
+
+    #[test]
+    fn connection_manager_writer_reads_and_writes() {
+        use frankensqlite::compat::RowExt;
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("cm.db");
+
+        let fs = FrankenStorage::open(&db_path).unwrap();
+        drop(fs);
+
+        let mgr = FrankenConnectionManager::new(&db_path, Default::default()).unwrap();
+
+        // Acquire writer and insert data
+        {
+            let mut guard = mgr.writer().unwrap();
+            guard
+                .storage()
+                .raw()
+                .execute("CREATE TABLE IF NOT EXISTS cm_test (id INTEGER PRIMARY KEY, val TEXT)")
+                .unwrap();
+            guard
+                .storage()
+                .raw()
+                .execute("INSERT INTO cm_test (val) VALUES ('hello')")
+                .unwrap();
+            guard.mark_committed();
+        }
+
+        // Verify via reader (returns MutexGuard<SendFrankenConnection>)
+        let reader_guard = mgr.reader();
+        let rows = reader_guard.query("SELECT val FROM cm_test").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get_typed::<String>(0).unwrap(), "hello");
+    }
+
+    #[test]
+    fn connection_manager_writer_guard_drops_releases_slot() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("cm.db");
+
+        let fs = FrankenStorage::open(&db_path).unwrap();
+        drop(fs);
+
+        let config = ConnectionManagerConfig {
+            reader_count: 1,
+            max_writers: 1,
+        };
+        let mgr = FrankenConnectionManager::new(&db_path, config).unwrap();
+
+        // Acquire and release writer
+        {
+            let mut guard = mgr.writer().unwrap();
+            guard.mark_committed();
+        }
+
+        // Should be able to acquire again (slot released)
+        let mut guard2 = mgr.writer().unwrap();
+        guard2.mark_committed();
+    }
+
+    #[test]
+    fn connection_manager_concurrent_writer_works() {
+        use frankensqlite::compat::RowExt;
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("cm.db");
+
+        let fs = FrankenStorage::open(&db_path).unwrap();
+        drop(fs);
+
+        let config = ConnectionManagerConfig {
+            reader_count: 1,
+            max_writers: 2,
+        };
+        let mgr = FrankenConnectionManager::new(&db_path, config).unwrap();
+
+        {
+            let mut guard = mgr.concurrent_writer().unwrap();
+            guard
+                .storage()
+                .raw()
+                .execute("CREATE TABLE IF NOT EXISTS cm_conc (id INTEGER PRIMARY KEY, val TEXT)")
+                .unwrap();
+            guard
+                .storage()
+                .raw()
+                .execute("INSERT INTO cm_conc (val) VALUES ('concurrent')")
+                .unwrap();
+            guard.mark_committed();
+        }
+
+        let reader_guard = mgr.reader();
+        let rows = reader_guard.query("SELECT val FROM cm_conc").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get_typed::<String>(0).unwrap(), "concurrent");
+    }
+
+    #[test]
+    fn connection_manager_default_config() {
+        let config = ConnectionManagerConfig::default();
+        assert_eq!(config.reader_count, 4);
+        assert!(config.max_writers > 0);
     }
 }

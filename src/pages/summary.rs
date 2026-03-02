@@ -25,10 +25,10 @@ use crate::pages::encrypt::{KeySlot, SlotType};
 use crate::pages::secret_scan::{SecretScanReport, SecretScanSummary};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use regex::Regex;
 use frankensqlite::Connection;
 use frankensqlite::Row;
 use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
@@ -504,10 +504,7 @@ impl<'a> SummaryGenerator<'a> {
     }
 
     /// Build filter WHERE clause.
-    fn build_filter_clause(
-        &self,
-        filters: &SummaryFilters,
-    ) -> (String, Vec<ParamValue>) {
+    fn build_filter_clause(&self, filters: &SummaryFilters) -> (String, Vec<ParamValue>) {
         let mut clauses = Vec::new();
         let mut params: Vec<ParamValue> = Vec::new();
 
@@ -551,10 +548,7 @@ impl<'a> SummaryGenerator<'a> {
     }
 
     /// Build SQL params for queries that prepend one local value before filter params.
-    fn prepend_params(
-        first: ParamValue,
-        params: &[ParamValue],
-    ) -> Vec<ParamValue> {
+    fn prepend_params(first: ParamValue, params: &[ParamValue]) -> Vec<ParamValue> {
         std::iter::once(first)
             .chain(params.iter().cloned())
             .collect()
@@ -573,29 +567,29 @@ impl<'a> SummaryGenerator<'a> {
         );
         let total_conversations: i64 = self
             .db
-            .query_row_map(
-                &conv_query,
-                params,
-                |row: &Row| row.get_typed(0),
-            )
+            .query_row_map(&conv_query, params, |row: &Row| row.get_typed(0))
             .context("Failed to count conversations")?;
 
-        // Count messages and characters
+        // Count messages and characters using subquery to avoid
+        // JOIN + aggregate without GROUP BY (frankensqlite limitation).
         let msg_query = format!(
-            "SELECT COUNT(*), COALESCE(SUM(LENGTH(m.content)), 0)
-             FROM messages m
-             JOIN conversations c ON m.conversation_id = c.id
-             WHERE 1=1{}",
+            "SELECT COUNT(*), SUM(LENGTH(content))
+             FROM messages
+             WHERE conversation_id IN (SELECT c.id FROM conversations c WHERE 1=1{})",
             where_clause
         );
         let (total_messages, total_characters): (i64, i64) = self
             .db
-            .query_row_map(
-                &msg_query,
-                params,
-                |row: &Row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
-            )
-            .context("Failed to count messages")?;
+            .query_map_collect(&msg_query, params, |row: &Row| {
+                Ok((
+                    row.get_typed::<Option<i64>>(0)?.unwrap_or(0),
+                    row.get_typed::<Option<i64>>(1)?.unwrap_or(0),
+                ))
+            })
+            .context("Failed to count messages")?
+            .into_iter()
+            .next()
+            .unwrap_or((0, 0));
 
         Ok((
             total_conversations as usize,
@@ -629,29 +623,65 @@ impl<'a> SummaryGenerator<'a> {
         where_clause: &str,
         params: &[ParamValue],
     ) -> Result<Vec<DateHistogramEntry>> {
+        // Use integer day computation instead of DATE() which isn't supported
+        // by frankensqlite. The day_epoch is seconds-since-epoch / 86400.
+        // Use subquery instead of JOIN to avoid frankensqlite aggregate limitation.
         let query = format!(
-            "SELECT DATE(m.created_at/1000, 'unixepoch') as date,
-                    COUNT(*) as msg_count,
-                    COUNT(DISTINCT m.conversation_id) as conv_count
-             FROM messages m
-             JOIN conversations c ON m.conversation_id = c.id
-             WHERE m.created_at IS NOT NULL{}
-             GROUP BY date
-             ORDER BY date",
+            "SELECT created_at / 1000 / 86400,
+                    COUNT(*)
+             FROM messages
+             WHERE created_at IS NOT NULL
+               AND conversation_id IN (SELECT c.id FROM conversations c WHERE 1=1{})
+             GROUP BY created_at / 1000 / 86400
+             ORDER BY created_at / 1000 / 86400",
             where_clause
         );
 
-        let entries = self.db.query_map_collect(
-            &query,
-            params,
-            |row: &Row| {
-                Ok(DateHistogramEntry {
-                    date: row.get_typed(0)?,
-                    message_count: row.get_typed::<i64>(1)? as usize,
-                    conversation_count: row.get_typed::<i64>(2)? as usize,
-                })
-            },
-        )?;
+        // Count distinct conversations per day using a subquery approach.
+        let conv_query = format!(
+            "SELECT day_epoch, COUNT(*)
+             FROM (
+                SELECT DISTINCT conversation_id, created_at / 1000 / 86400 AS day_epoch
+                FROM messages
+                WHERE created_at IS NOT NULL
+                  AND conversation_id IN (SELECT c.id FROM conversations c WHERE 1=1{})
+             )
+             GROUP BY day_epoch",
+            where_clause
+        );
+
+        let day_msg_rows = self.db.query_map_collect(&query, params, |row: &Row| {
+            let day_epoch: i64 = row.get_typed::<Option<i64>>(0)?.unwrap_or(0);
+            let msg_count: i64 = row.get_typed::<Option<i64>>(1)?.unwrap_or(0);
+            Ok((day_epoch, msg_count as usize))
+        })?;
+
+        let day_conv_rows = self
+            .db
+            .query_map_collect(&conv_query, params, |row: &Row| {
+                let day_epoch: i64 = row.get_typed::<Option<i64>>(0)?.unwrap_or(0);
+                let conv_count: i64 = row.get_typed::<Option<i64>>(1)?.unwrap_or(0);
+                Ok((day_epoch, conv_count as usize))
+            })?;
+
+        let conv_map: std::collections::HashMap<i64, usize> = day_conv_rows.into_iter().collect();
+
+        use chrono::{NaiveDate, TimeDelta};
+        let epoch_base = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+        let entries: Vec<DateHistogramEntry> = day_msg_rows
+            .into_iter()
+            .map(|(day_epoch, message_count)| {
+                let date = epoch_base
+                    .checked_add_signed(TimeDelta::days(day_epoch))
+                    .map(|d| d.format("%Y-%m-%d").to_string())
+                    .unwrap_or_else(|| format!("{day_epoch}"));
+                DateHistogramEntry {
+                    date,
+                    message_count,
+                    conversation_count: conv_map.get(&day_epoch).copied().unwrap_or(0),
+                }
+            })
+            .collect();
         Ok(entries)
     }
 
@@ -671,34 +701,27 @@ impl<'a> SummaryGenerator<'a> {
             where_clause
         );
 
-        let ws_rows = self.db.query_map_collect(
-            &query,
-            params,
-            |row: &Row| {
-                Ok((
-                    row.get_typed::<String>(0)?,
-                    row.get_typed::<i64>(1)?,
-                    row.get_typed::<Option<i64>>(2)?,
-                    row.get_typed::<Option<i64>>(3)?,
-                ))
-            },
-        )?;
+        let ws_rows = self.db.query_map_collect(&query, params, |row: &Row| {
+            Ok((
+                row.get_typed::<String>(0)?,
+                row.get_typed::<i64>(1)?,
+                row.get_typed::<Option<i64>>(2)?,
+                row.get_typed::<Option<i64>>(3)?,
+            ))
+        })?;
 
         let mut workspaces = Vec::new();
         for (workspace, conv_count, min_ts, max_ts) in ws_rows {
             // Get message count for this workspace
             let msg_query = format!(
-                "SELECT COUNT(*) FROM messages m
-                 JOIN conversations c ON m.conversation_id = c.id
-                 WHERE c.workspace = ?{}",
+                "SELECT COUNT(*) FROM messages
+                 WHERE conversation_id IN (SELECT c.id FROM conversations c WHERE c.workspace = ?{})",
                 where_clause
             );
             let prepended = Self::prepend_params(ParamValue::from(workspace.as_str()), params);
-            let msg_count: i64 = self.db.query_row_map(
-                &msg_query,
-                &prepended,
-                |row: &Row| row.get_typed(0),
-            )?;
+            let msg_count: i64 = self.db.query_row_map(&msg_query, &prepended, |row: &Row| {
+                Ok(row.get_typed::<Option<i64>>(0)?.unwrap_or(0))
+            })?;
 
             // Get sample titles
             let title_query = format!(
@@ -707,12 +730,13 @@ impl<'a> SummaryGenerator<'a> {
                  ORDER BY c.started_at DESC LIMIT 5",
                 where_clause
             );
-            let title_prepended = Self::prepend_params(ParamValue::from(workspace.as_str()), params);
-            let titles: Vec<String> = self.db.query_map_collect(
-                &title_query,
-                &title_prepended,
-                |row: &Row| row.get_typed(0),
-            )?;
+            let title_prepended =
+                Self::prepend_params(ParamValue::from(workspace.as_str()), params);
+            let titles: Vec<String> =
+                self.db
+                    .query_map_collect(&title_query, &title_prepended, |row: &Row| {
+                        row.get_typed(0)
+                    })?;
 
             // Extract display name
             let display_name = std::path::Path::new(&workspace)
@@ -750,27 +774,22 @@ impl<'a> SummaryGenerator<'a> {
             where_clause
         );
 
-        let agent_rows = self.db.query_map_collect(
-            &query,
-            params,
-            |row: &Row| Ok((row.get_typed::<String>(0)?, row.get_typed::<i64>(1)?)),
-        )?;
+        let agent_rows = self.db.query_map_collect(&query, params, |row: &Row| {
+            Ok((row.get_typed::<String>(0)?, row.get_typed::<i64>(1)?))
+        })?;
 
         let mut agents = Vec::new();
         for (agent, conv_count) in agent_rows {
             // Get message count
             let msg_query = format!(
-                "SELECT COUNT(*) FROM messages m
-                 JOIN conversations c ON m.conversation_id = c.id
-                 WHERE c.agent = ?{}",
+                "SELECT COUNT(*) FROM messages
+                 WHERE conversation_id IN (SELECT c.id FROM conversations c WHERE c.agent = ?{})",
                 where_clause
             );
             let prepended = Self::prepend_params(ParamValue::from(agent.as_str()), params);
-            let msg_count: i64 = self.db.query_row_map(
-                &msg_query,
-                &prepended,
-                |row: &Row| row.get_typed(0),
-            )?;
+            let msg_count: i64 = self.db.query_row_map(&msg_query, &prepended, |row: &Row| {
+                Ok(row.get_typed::<Option<i64>>(0)?.unwrap_or(0))
+            })?;
 
             let percentage = if total_conversations > 0 {
                 (conv_count as f64 / total_conversations as f64) * 100.0
@@ -810,25 +829,21 @@ impl<'a> SummaryGenerator<'a> {
         let query = format!(
             "SELECT c.id, c.workspace, c.title,
                     (SELECT COUNT(*) FROM messages WHERE conversation_id = c.id),
-                    (SELECT COALESCE(SUM(LENGTH(content)), 0) FROM messages WHERE conversation_id = c.id)
+                    (SELECT SUM(LENGTH(content)) FROM messages WHERE conversation_id = c.id)
              FROM conversations c
              WHERE 1=1{}",
             where_clause
         );
 
-        let conv_rows = self.db.query_map_collect(
-            &query,
-            &params,
-            |row: &Row| {
-                Ok((
-                    row.get_typed::<i64>(0)?,
-                    row.get_typed::<Option<String>>(1)?,
-                    row.get_typed::<Option<String>>(2)?,
-                    row.get_typed::<i64>(3)?,
-                    row.get_typed::<i64>(4)?,
-                ))
-            },
-        )?;
+        let conv_rows = self.db.query_map_collect(&query, &params, |row: &Row| {
+            Ok((
+                row.get_typed::<i64>(0)?,
+                row.get_typed::<Option<String>>(1)?,
+                row.get_typed::<Option<String>>(2)?,
+                row.get_typed::<i64>(3)?,
+                row.get_typed::<Option<i64>>(4)?.unwrap_or(0),
+            ))
+        })?;
 
         for (id, workspace, title, msgs, chars) in conv_rows {
             let title_str = title.as_deref().unwrap_or("");
@@ -1055,8 +1070,7 @@ mod tests {
             };
             for idx in 0..msg_count {
                 let role = if idx % 2 == 0 { "user" } else { "assistant" };
-                let created_at =
-                    1700000000000i64 + (conv_id * 100000000) + (idx as i64 * 1000);
+                let created_at = 1700000000000i64 + (conv_id * 100000000) + (idx as i64 * 1000);
                 conn.execute_params(
                     "INSERT INTO messages (conversation_id, idx, role, content, created_at)
                      VALUES (?1, ?2, ?3, ?4, ?5)",

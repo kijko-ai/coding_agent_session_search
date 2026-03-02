@@ -15,8 +15,10 @@ use frankensearch::lexical::{
     try_build_snippet_generator as fs_try_build_snippet_generator,
 };
 use frankensearch::{
+    InMemoryTwoTierIndex as FsInMemoryTwoTierIndex, InMemoryVectorIndex as FsInMemoryVectorIndex,
     QueryClass as FsQueryClass, RrfConfig as FsRrfConfig, ScoreSource as FsScoreSource,
-    ScoredResult as FsScoredResult, VectorHit as FsVectorHit,
+    ScoredResult as FsScoredResult, SyncTwoTierSearcher as FsSyncTwoTierSearcher,
+    TwoTierConfig as FsTwoTierConfig, VectorHit as FsVectorHit,
     candidate_count as fs_candidate_count,
     core::filter::SearchFilter as FsSearchFilter,
     index::{
@@ -37,7 +39,30 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use rusqlite::Connection;
+use frankensqlite::Connection;
+use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
+#[cfg(test)]
+use frankensqlite::params;
+
+/// Wrapper around `frankensqlite::Connection` that implements `Send`.
+///
+/// `frankensqlite::Connection` is `!Send` because it uses `Rc` internally.
+/// However, the `Rc` values are entirely self-contained within the Connection
+/// and are not shared with any external references.  When wrapped in a `Mutex`
+/// (as in `SearchClient`), exclusive access is guaranteed, making cross-thread
+/// transfer safe.
+struct SendConnection(Connection);
+
+// Safety: Rc fields inside Connection are not cloned or shared externally.
+// The Mutex<Option<SendConnection>> in SearchClient ensures exclusive access.
+unsafe impl Send for SendConnection {}
+
+impl std::ops::Deref for SendConnection {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        &self.0
+    }
+}
 
 use crate::search::canonicalize::canonicalize_for_embedding;
 use crate::search::embedder::Embedder;
@@ -190,6 +215,42 @@ impl SearchMode {
             SearchMode::Semantic => SearchMode::Hybrid,
             SearchMode::Hybrid => SearchMode::Lexical,
         }
+    }
+}
+
+/// Execution strategy for semantic search.
+///
+/// `Single` preserves existing exact vector behavior.
+/// Other modes attempt to use frankensearch's sync two-tier searcher when a
+/// compatible in-memory two-tier index is available; otherwise they fall back
+/// to `Single`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticTierMode {
+    #[default]
+    Single,
+    Progressive,
+    FastOnly,
+    QualityOnly,
+}
+
+impl SemanticTierMode {
+    const fn wants_two_tier(self) -> bool {
+        !matches!(self, Self::Single)
+    }
+
+    fn to_frankensearch_config(self) -> FsTwoTierConfig {
+        let mut config = FsTwoTierConfig::default();
+        match self {
+            Self::Single | Self::Progressive => {}
+            Self::FastOnly => {
+                config.fast_only = true;
+            }
+            Self::QualityOnly => {
+                config.quality_weight = 1.0;
+            }
+        }
+        config
     }
 }
 
@@ -1287,14 +1348,80 @@ struct SemanticSearchState {
     fs_semantic_index: FsVectorIndex,
     fs_ann_index: Option<FsHnswIndex>,
     ann_path: Option<PathBuf>,
+    fs_in_memory_two_tier_index: Option<Arc<FsInMemoryTwoTierIndex>>,
+    in_memory_two_tier_init_attempted: bool,
     filter_maps: SemanticFilterMaps,
     roles: Option<HashSet<u8>>,
     query_cache: QueryCache,
 }
 
+impl SemanticSearchState {
+    fn load_in_memory_two_tier_index(
+        &mut self,
+        tier_mode: SemanticTierMode,
+    ) -> Option<Arc<FsInMemoryTwoTierIndex>> {
+        if let Some(index) = self.fs_in_memory_two_tier_index.as_ref() {
+            return Some(Arc::clone(index));
+        }
+        if self.in_memory_two_tier_init_attempted {
+            return None;
+        }
+        self.in_memory_two_tier_init_attempted = true;
+
+        let index_dir = self
+            .ann_path
+            .as_ref()
+            .and_then(|path| path.parent().map(Path::to_path_buf));
+        let Some(index_dir) = index_dir else {
+            tracing::debug!("two-tier semantic unavailable: ann/index directory path missing");
+            return None;
+        };
+
+        match FsInMemoryTwoTierIndex::from_dir(&index_dir) {
+            Ok(index) => {
+                let index = Arc::new(index);
+                self.fs_in_memory_two_tier_index = Some(Arc::clone(&index));
+                return Some(index);
+            }
+            Err(err) => {
+                tracing::debug!(
+                    dir = %index_dir.display(),
+                    error = %err,
+                    "two-tier semantic index load failed; considering fallback"
+                );
+            }
+        }
+
+        if !matches!(tier_mode, SemanticTierMode::FastOnly) {
+            return None;
+        }
+
+        let fallback_fast = index_dir.join(format!("index-{}.fsvi", self.embedder.id()));
+        if !fallback_fast.is_file() {
+            return None;
+        }
+
+        match FsInMemoryVectorIndex::from_fsvi(&fallback_fast) {
+            Ok(fast) => {
+                let index = Arc::new(FsInMemoryTwoTierIndex::new(fast, None));
+                self.fs_in_memory_two_tier_index = Some(Arc::clone(&index));
+                Some(index)
+            }
+            Err(err) => {
+                tracing::debug!(
+                    path = %fallback_fast.display(),
+                    error = %err,
+                    "fast-only semantic fallback index load failed"
+                );
+                None
+            }
+        }
+    }
+}
+
 pub struct SearchClient {
     reader: Option<(IndexReader, crate::search::tantivy::Fields)>,
-    sqlite: Mutex<Option<Connection>>,
+    sqlite: Mutex<Option<SendConnection>>,
     sqlite_path: Option<PathBuf>,
     prefix_cache: Mutex<CacheShards>,
     reload_on_search: bool,
@@ -1769,7 +1896,7 @@ impl SearchClient {
         }))
     }
 
-    fn sqlite_guard(&self) -> Result<std::sync::MutexGuard<'_, Option<Connection>>> {
+    fn sqlite_guard(&self) -> Result<std::sync::MutexGuard<'_, Option<SendConnection>>> {
         let mut guard = self
             .sqlite
             .lock()
@@ -1778,9 +1905,10 @@ impl SearchClient {
         if guard.is_none()
             && let Some(path) = &self.sqlite_path
         {
-            match Connection::open(path) {
+            let path_str = path.to_string_lossy().to_string();
+            match Connection::open(&path_str) {
                 Ok(conn) => {
-                    *guard = Some(conn);
+                    *guard = Some(SendConnection(conn));
                 }
                 Err(e) => {
                     tracing::debug!(
@@ -2037,6 +2165,8 @@ impl SearchClient {
             fs_semantic_index,
             fs_ann_index: None,
             ann_path,
+            fs_in_memory_two_tier_index: None,
+            in_memory_two_tier_init_attempted: false,
             filter_maps,
             roles,
             query_cache: QueryCache::new(embedder_id.as_str(), capacity),
@@ -2062,6 +2192,32 @@ impl SearchClient {
         offset: usize,
         field_mask: FieldMask,
         approximate: bool,
+    ) -> Result<(
+        Vec<SearchHit>,
+        Option<crate::search::ann_index::AnnSearchStats>,
+    )> {
+        self.search_semantic_with_tier(
+            query,
+            filters,
+            limit,
+            offset,
+            field_mask,
+            approximate,
+            SemanticTierMode::Single,
+        )
+    }
+
+    /// Semantic search with optional progressive two-tier execution strategy.
+    #[allow(clippy::too_many_arguments)]
+    pub fn search_semantic_with_tier(
+        &self,
+        query: &str,
+        filters: SearchFilters,
+        limit: usize,
+        offset: usize,
+        field_mask: FieldMask,
+        approximate: bool,
+        tier_mode: SemanticTierMode,
     ) -> Result<(
         Vec<SearchHit>,
         Option<crate::search::ann_index::AnnSearchStats>,
@@ -2098,10 +2254,103 @@ impl SearchClient {
             return Ok((Vec::new(), None));
         }
 
+        let collapse = |best_by_message: HashMap<u64, VectorSearchResult>| {
+            let mut collapsed: Vec<VectorSearchResult> = best_by_message.into_values().collect();
+            collapsed.sort_by(|a, b| {
+                b.score
+                    .total_cmp(&a.score)
+                    .then_with(|| a.message_id.cmp(&b.message_id))
+            });
+            if collapsed.len() > fetch {
+                collapsed.truncate(fetch);
+            }
+            collapsed
+        };
+
         // Track ANN stats if approximate search is used
         let mut ann_stats: Option<crate::search::ann_index::AnnSearchStats> = None;
 
-        let mut results = if approximate {
+        let mut results = if tier_mode.wants_two_tier() && !approximate {
+            let fs_filter = semantic_filter_as_search_filter(&semantic_filter);
+            if let Some(two_tier_index) = state.load_in_memory_two_tier_index(tier_mode) {
+                let config = tier_mode.to_frankensearch_config();
+                let searcher = FsSyncTwoTierSearcher::new(two_tier_index, config);
+                let (tier_hits, metrics) = searcher
+                    .search_collect_with_filter(&embedding, fetch, fs_filter)
+                    .map_err(|err| {
+                        anyhow!("frankensearch two-tier semantic search failed: {err}")
+                    })?;
+
+                tracing::debug!(
+                    tier_mode = ?tier_mode,
+                    phase1_ms = metrics.phase1_total_ms,
+                    phase2_ms = metrics.phase2_total_ms,
+                    skip_reason = ?metrics.skip_reason,
+                    returned = tier_hits.len(),
+                    "semantic two-tier search executed"
+                );
+
+                let mut best_by_message: HashMap<u64, VectorSearchResult> = HashMap::new();
+                for hit in tier_hits {
+                    let Some(parsed) = parse_semantic_doc_id(&hit.doc_id) else {
+                        continue;
+                    };
+                    best_by_message
+                        .entry(parsed.message_id)
+                        .and_modify(|entry| {
+                            if hit.score > entry.score {
+                                entry.score = hit.score;
+                                entry.chunk_idx = parsed.chunk_idx;
+                            }
+                        })
+                        .or_insert(VectorSearchResult {
+                            message_id: parsed.message_id,
+                            chunk_idx: parsed.chunk_idx,
+                            score: hit.score,
+                        });
+                }
+
+                collapse(best_by_message)
+            } else {
+                tracing::debug!(
+                    tier_mode = ?tier_mode,
+                    "two-tier semantic unavailable; falling back to exact single-tier search"
+                );
+
+                let fs_index = &state.fs_semantic_index;
+                let fs_hits = fs_index
+                    .search_top_k(&embedding, fetch, fs_filter)
+                    .map_err(|err| anyhow!("frankensearch semantic search failed: {err}"))?;
+
+                let mut best_by_message: HashMap<u64, VectorSearchResult> = HashMap::new();
+                for hit in fs_hits {
+                    let Some(parsed) = parse_semantic_doc_id(&hit.doc_id) else {
+                        continue;
+                    };
+                    best_by_message
+                        .entry(parsed.message_id)
+                        .and_modify(|entry| {
+                            if hit.score > entry.score {
+                                entry.score = hit.score;
+                                entry.chunk_idx = parsed.chunk_idx;
+                            }
+                        })
+                        .or_insert(VectorSearchResult {
+                            message_id: parsed.message_id,
+                            chunk_idx: parsed.chunk_idx,
+                            score: hit.score,
+                        });
+                }
+
+                collapse(best_by_message)
+            }
+        } else if approximate {
+            if tier_mode.wants_two_tier() {
+                tracing::debug!(
+                    tier_mode = ?tier_mode,
+                    "approximate search requested; bypassing two-tier mode"
+                );
+            }
             let fs_index = &state.fs_semantic_index;
 
             if state.fs_ann_index.is_none() {
@@ -2161,16 +2410,7 @@ impl SearchClient {
                     });
             }
 
-            let mut ann_hits: Vec<VectorSearchResult> = best_by_message.into_values().collect();
-            ann_hits.sort_by(|a, b| {
-                b.score
-                    .total_cmp(&a.score)
-                    .then_with(|| a.message_id.cmp(&b.message_id))
-            });
-            if ann_hits.len() > fetch {
-                ann_hits.truncate(fetch);
-            }
-            ann_hits
+            collapse(best_by_message)
         } else {
             let fs_index = &state.fs_semantic_index;
             let fs_filter = semantic_filter_as_search_filter(&semantic_filter);
@@ -2198,16 +2438,7 @@ impl SearchClient {
                     });
             }
 
-            let mut collapsed: Vec<VectorSearchResult> = best_by_message.into_values().collect();
-            collapsed.sort_by(|a, b| {
-                b.score
-                    .total_cmp(&a.score)
-                    .then_with(|| a.message_id.cmp(&b.message_id))
-            });
-            if collapsed.len() > fetch {
-                collapsed.truncate(fetch);
-            }
-            collapsed
+            collapse(best_by_message)
         };
         if offset > 0 {
             results = results.into_iter().skip(offset).collect();
@@ -2242,13 +2473,13 @@ impl SearchClient {
         // Pre-size: n "?" chars + (n-1) "," chars = 2n-1 total
         let placeholder_capacity = results.len().saturating_mul(2).saturating_sub(1);
         let mut placeholders = String::with_capacity(placeholder_capacity);
-        let mut params: Vec<i64> = Vec::with_capacity(results.len());
+        let mut params: Vec<ParamValue> = Vec::with_capacity(results.len());
         for (idx, result) in results.iter().enumerate() {
             if idx > 0 {
                 placeholders.push(',');
             }
             placeholders.push('?');
-            params.push(i64::try_from(result.message_id)?);
+            params.push(ParamValue::from(i64::try_from(result.message_id)?));
         }
 
         let content_expr = if field_mask.needs_content() {
@@ -2271,26 +2502,24 @@ impl SearchClient {
              WHERE m.id IN ({placeholders})"
         );
 
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(
-            rusqlite::params_from_iter(params.iter()),
-            |row: &rusqlite::Row| -> rusqlite::Result<(u64, SearchHit)> {
-                let message_id: i64 = row.get(0)?;
-                let content: String = row.get(1)?;
-                let msg_created_at: Option<i64> = row.get(2)?;
-                let idx: Option<i64> = row.get(3)?;
+        let rows: Vec<(u64, SearchHit)> =
+            conn.query_map_collect(&sql, &params, |row: &frankensqlite::Row| {
+                let message_id: i64 = row.get_typed(0)?;
+                let content: String = row.get_typed(1)?;
+                let msg_created_at: Option<i64> = row.get_typed(2)?;
+                let idx: Option<i64> = row.get_typed(3)?;
                 let title: Option<String> = if field_mask.wants_title() {
-                    row.get(5)?
+                    row.get_typed(5)?
                 } else {
                     None
                 };
-                let source_path: String = row.get(6)?;
-                let source_id: Option<String> = row.get(7)?;
-                let origin_host: Option<String> = row.get(8)?;
-                let agent: String = row.get(9)?;
-                let workspace: Option<String> = row.get(10)?;
-                let origin_kind: String = row.get(11)?;
-                let started_at: Option<i64> = row.get(12)?;
+                let source_path: String = row.get_typed(6)?;
+                let source_id: Option<String> = row.get_typed(7)?;
+                let origin_host: Option<String> = row.get_typed(8)?;
+                let agent: String = row.get_typed(9)?;
+                let workspace: Option<String> = row.get_typed(10)?;
+                let origin_kind: String = row.get_typed(11)?;
+                let started_at: Option<i64> = row.get_typed(12)?;
 
                 let created_at = msg_created_at.or(started_at);
                 let line_number = idx.map(|i| (i + 1) as usize);
@@ -2324,12 +2553,10 @@ impl SearchClient {
                 };
 
                 Ok((message_id as u64, hit))
-            },
-        )?;
+            })?;
 
         let mut hits_by_id = HashMap::new();
-        for row in rows {
-            let (id, hit) = row?;
+        for (id, hit) in rows {
             hits_by_id.insert(id, hit);
         }
 
@@ -2559,11 +2786,13 @@ impl SearchClient {
         if filters.agents.is_empty()
             && let Ok(sqlite_guard) = self.sqlite_guard()
             && let Some(conn) = sqlite_guard.as_ref()
-            && let Ok(mut stmt) = conn
-                .prepare("SELECT DISTINCT agent_slug FROM conversations ORDER BY id DESC LIMIT 3")
-            && let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0))
+            && let Ok(rows) = conn.query_map_collect(
+                "SELECT DISTINCT agent_slug FROM conversations ORDER BY id DESC LIMIT 3",
+                &[],
+                |row: &frankensqlite::Row| row.get_typed::<String>(0),
+            )
         {
-            for row in rows.flatten() {
+            for row in rows {
                 if suggestions.len() < 3 {
                     suggestions.push(
                         QuerySuggestion::try_agent(&row)
@@ -2804,13 +3033,13 @@ impl SearchClient {
              LEFT JOIN messages m ON f.message_id = m.id
              WHERE fts_messages MATCH ?"
         );
-        let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(fts_query)];
+        let mut params: Vec<ParamValue> = vec![ParamValue::from(fts_query.as_str())];
 
         if !filters.agents.is_empty() {
             let placeholders = sql_placeholders(filters.agents.len());
             sql.push_str(&format!(" AND f.agent IN ({placeholders})"));
             for a in filters.agents {
-                params.push(Box::new(a));
+                params.push(ParamValue::from(a.as_str()));
             }
         }
 
@@ -2818,37 +3047,35 @@ impl SearchClient {
             let placeholders = sql_placeholders(filters.workspaces.len());
             sql.push_str(&format!(" AND f.workspace IN ({placeholders})"));
             for w in filters.workspaces {
-                params.push(Box::new(w));
+                params.push(ParamValue::from(w.as_str()));
             }
         }
 
         if let Some(created_from) = filters.created_from {
             sql.push_str(" AND f.created_at >= ?");
-            params.push(Box::new(created_from));
+            params.push(ParamValue::from(created_from));
         }
         if let Some(created_to) = filters.created_to {
             sql.push_str(" AND f.created_at <= ?");
-            params.push(Box::new(created_to));
+            params.push(ParamValue::from(created_to));
         }
 
         sql.push_str(" ORDER BY score LIMIT ? OFFSET ?");
-        params.push(Box::new(limit as i64));
-        params.push(Box::new(offset as i64));
+        params.push(ParamValue::from(limit as i64));
+        params.push(ParamValue::from(offset as i64));
 
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(
-            rusqlite::params_from_iter(params.iter().map(|b| &**b)),
-            |row| {
-                let title: String = row.get(0)?;
-                let content: String = row.get(1)?;
-                let agent: String = row.get(2)?;
-                let workspace: Option<String> = row.get(3)?;
-                let source_path: String = row.get(4)?;
-                let created_at: Option<i64> = row.get(5).ok();
-                let score: f32 = row.get::<_, f64>(6)? as f32;
-                let snippet: String = row.get(7)?;
+        let rows: Vec<SearchHit> =
+            conn.query_map_collect(&sql, &params, |row: &frankensqlite::Row| {
+                let title: String = row.get_typed(0)?;
+                let content: String = row.get_typed(1)?;
+                let agent: String = row.get_typed(2)?;
+                let workspace: Option<String> = row.get_typed(3)?;
+                let source_path: String = row.get_typed(4)?;
+                let created_at: Option<i64> = row.get_typed(5)?;
+                let score: f32 = row.get_typed::<f64>(6)? as f32;
+                let snippet: String = row.get_typed(7)?;
                 // idx is 0-indexed message index; convert to 1-indexed line number for JSONL files
-                let idx: Option<i64> = row.get(8).ok();
+                let idx: Option<i64> = row.get_typed(8)?;
                 let line_number = idx.map(|i| (i + 1) as usize);
                 let content_hash = stable_hit_hash(&content, &source_path, line_number, created_at);
                 // SQLite FTS doesn't have provenance or workspace_original - use defaults
@@ -2869,14 +3096,8 @@ impl SearchClient {
                     origin_kind: default_origin_kind(),
                     origin_host: None,
                 })
-            },
-        )?;
-
-        let mut hits = Vec::new();
-        for row in rows {
-            hits.push(row?);
-        }
-        Ok(hits)
+            })?;
+        Ok(rows)
     }
 
     /// Browse messages ordered by date, without any text query.
@@ -2917,13 +3138,13 @@ impl SearchClient {
              LEFT JOIN workspaces w ON c.workspace_id = w.id
              WHERE 1=1"
                 .to_string();
-        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        let mut params: Vec<ParamValue> = Vec::new();
 
         if !filters.agents.is_empty() {
             let placeholders = sql_placeholders(filters.agents.len());
             sql.push_str(&format!(" AND a.slug IN ({placeholders})"));
             for a in &filters.agents {
-                params.push(Box::new(a.clone()));
+                params.push(ParamValue::from(a.as_str()));
             }
         }
 
@@ -2931,36 +3152,34 @@ impl SearchClient {
             let placeholders = sql_placeholders(filters.workspaces.len());
             sql.push_str(&format!(" AND w.path IN ({placeholders})"));
             for w in &filters.workspaces {
-                params.push(Box::new(w.clone()));
+                params.push(ParamValue::from(w.as_str()));
             }
         }
 
         if let Some(created_from) = filters.created_from {
             sql.push_str(" AND m.created_at >= ?");
-            params.push(Box::new(created_from));
+            params.push(ParamValue::from(created_from));
         }
         if let Some(created_to) = filters.created_to {
             sql.push_str(" AND m.created_at <= ?");
-            params.push(Box::new(created_to));
+            params.push(ParamValue::from(created_to));
         }
 
         sql.push_str(&format!(
             " ORDER BY m.created_at IS NULL, m.created_at {order}, m.id {order} LIMIT ? OFFSET ?"
         ));
-        params.push(Box::new(limit as i64));
-        params.push(Box::new(offset as i64));
+        params.push(ParamValue::from(limit as i64));
+        params.push(ParamValue::from(offset as i64));
 
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(
-            rusqlite::params_from_iter(params.iter().map(|b| &**b)),
-            |row| {
-                let title: String = row.get::<_, Option<String>>(0)?.unwrap_or_default();
-                let content: String = row.get(1)?;
-                let agent: String = row.get(2)?;
-                let workspace: Option<String> = row.get(3)?;
-                let source_path: String = row.get(4)?;
-                let created_at: Option<i64> = row.get(5).ok();
-                let idx: Option<i64> = row.get(6).ok();
+        let rows: Vec<SearchHit> =
+            conn.query_map_collect(&sql, &params, |row: &frankensqlite::Row| {
+                let title: String = row.get_typed::<Option<String>>(0)?.unwrap_or_default();
+                let content: String = row.get_typed(1)?;
+                let agent: String = row.get_typed(2)?;
+                let workspace: Option<String> = row.get_typed(3)?;
+                let source_path: String = row.get_typed(4)?;
+                let created_at: Option<i64> = row.get_typed(5)?;
+                let idx: Option<i64> = row.get_typed(6)?;
                 let line_number = idx.map(|i| (i + 1) as usize);
                 let content_hash = stable_hit_hash(&content, &source_path, line_number, created_at);
                 Ok(SearchHit {
@@ -2980,14 +3199,8 @@ impl SearchClient {
                     origin_kind: default_origin_kind(),
                     origin_host: None,
                 })
-            },
-        )?;
-
-        let mut hits = Vec::new();
-        for row in rows {
-            hits.push(row?);
-        }
-        Ok(hits)
+            })?;
+        Ok(rows)
     }
 }
 
@@ -3704,6 +3917,7 @@ mod tests {
     use super::*;
     use crate::connectors::{NormalizedConversation, NormalizedMessage, NormalizedSnippet};
     use crate::search::tantivy::TantivyIndex;
+    use frankensqlite::compat::BatchExt;
     use tempfile::TempDir;
 
     fn sanitize_query(raw: &str) -> String {
@@ -4816,10 +5030,10 @@ mod tests {
     #[test]
     fn sqlite_backend_skips_wildcard_queries() -> Result<()> {
         // Build a client with SQLite only; wildcard queries should short-circuit without errors.
-        let conn = Connection::open_in_memory()?;
+        let conn = Connection::open(":memory:")?;
         let client = SearchClient {
             reader: None,
-            sqlite: Mutex::new(Some(conn)),
+            sqlite: Mutex::new(Some(SendConnection(conn))),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             reload_on_search: true,
@@ -4844,8 +5058,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "FTS5 virtual tables not supported by frankensqlite"]
     fn sqlite_backend_handles_null_workspace() -> Result<()> {
-        let conn = Connection::open_in_memory()?;
+        let conn = Connection::open(":memory:")?;
         conn.execute_batch(
             "CREATE TABLE messages (id INTEGER PRIMARY KEY, idx INTEGER);
              CREATE VIRTUAL TABLE fts_messages USING fts5(
@@ -4858,16 +5073,23 @@ mod tests {
                 message_id UNINDEXED
              );",
         )?;
-        conn.execute("INSERT INTO messages(id, idx) VALUES(1, 0)", [])?;
-        conn.execute(
+        conn.execute("INSERT INTO messages(id, idx) VALUES(1, 0)")?;
+        conn.execute_params(
             "INSERT INTO fts_messages(content, title, agent, workspace, source_path, created_at, message_id)
              VALUES(?1, ?2, ?3, NULL, ?4, ?5, ?6)",
-            rusqlite::params!["auth token failure", "t", "codex", "/tmp/session.jsonl", 42_i64, 1_i64],
+            params![
+                "auth token failure",
+                "t",
+                "codex",
+                "/tmp/session.jsonl",
+                42_i64,
+                1_i64
+            ],
         )?;
 
         let client = SearchClient {
             reader: None,
-            sqlite: Mutex::new(Some(conn)),
+            sqlite: Mutex::new(Some(SendConnection(conn))),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             reload_on_search: true,

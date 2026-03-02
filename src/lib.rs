@@ -2666,12 +2666,23 @@ async fn execute_cli(
                     }
 
                     // Build semantic options from new flags
+                    let tier_mode = if two_tier {
+                        crate::search::query::SemanticTierMode::Progressive
+                    } else if fast_only {
+                        crate::search::query::SemanticTierMode::FastOnly
+                    } else if quality_only {
+                        crate::search::query::SemanticTierMode::QualityOnly
+                    } else {
+                        crate::search::query::SemanticTierMode::Single
+                    };
+
                     let semantic_opts = SemanticSearchOptions {
                         model: model.clone(),
                         rerank,
                         reranker: reranker.clone(),
                         use_daemon: daemon && !no_daemon,
                         approximate,
+                        tier_mode,
                     };
 
                     run_cli_search(
@@ -3555,6 +3566,36 @@ fn analytics_build_filters(common: &AnalyticsCommon) -> Vec<String> {
     f
 }
 
+/// Open a read-only frankensqlite connection for analytics queries.
+fn open_franken_analytics_db(
+    data_dir: &Option<PathBuf>,
+    db_path_override: Option<&PathBuf>,
+) -> CliResult<frankensqlite::Connection> {
+    let data_dir = data_dir.clone().unwrap_or_else(default_data_dir);
+    let path = db_path_override
+        .cloned()
+        .unwrap_or_else(|| data_dir.join("agent_search.db"));
+    if !path.exists() {
+        return Err(CliError {
+            code: 3,
+            kind: "missing-db",
+            message: format!(
+                "Database not found at {}. Run 'cass index --full' first.",
+                path.display()
+            ),
+            hint: Some("Run 'cass index --full' to create the database.".into()),
+            retryable: true,
+        });
+    }
+    frankensqlite::Connection::open(path.to_string_lossy().as_ref()).map_err(|e| CliError {
+        code: 9,
+        kind: "db-open",
+        message: format!("Failed to open database at {}: {e}", path.display()),
+        hint: None,
+        retryable: false,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // analytics status — delegates to crate::analytics::query
 // ---------------------------------------------------------------------------
@@ -3564,9 +3605,7 @@ fn run_analytics_status(
     common: &AnalyticsCommon,
     db_path_override: Option<&PathBuf>,
 ) -> CliResult<serde_json::Value> {
-    let lazy =
-        crate::storage::sqlite::LazyDb::from_overrides(&common.data_dir, db_path_override.cloned());
-    let conn = lazy.get("analytics-status").map_err(lazy_db_to_cli_error)?;
+    let conn = open_franken_analytics_db(&common.data_dir, db_path_override)?;
     let filter = analytics::AnalyticsFilter::from(common);
 
     analytics::query::query_status(&conn, &filter)
@@ -3590,9 +3629,7 @@ fn run_analytics_tokens(
     group_by: AnalyticsBucketing,
     db_path_override: Option<&PathBuf>,
 ) -> CliResult<serde_json::Value> {
-    let lazy =
-        crate::storage::sqlite::LazyDb::from_overrides(&common.data_dir, db_path_override.cloned());
-    let conn = lazy.get("analytics-tokens").map_err(lazy_db_to_cli_error)?;
+    let conn = open_franken_analytics_db(&common.data_dir, db_path_override)?;
     let filter = analytics::AnalyticsFilter::from(common);
 
     analytics::query::query_tokens_timeseries(&conn, &filter, group_by.into())
@@ -3693,9 +3730,7 @@ fn run_analytics_tools(
     limit: usize,
     db_path_override: Option<&PathBuf>,
 ) -> CliResult<serde_json::Value> {
-    let lazy =
-        crate::storage::sqlite::LazyDb::from_overrides(&common.data_dir, db_path_override.cloned());
-    let conn = lazy.get("analytics-tools").map_err(lazy_db_to_cli_error)?;
+    let conn = open_franken_analytics_db(&common.data_dir, db_path_override)?;
     let filter = analytics::AnalyticsFilter::from(common);
 
     analytics::query::query_tools(&conn, &filter, group_by.into(), limit)
@@ -3719,11 +3754,7 @@ fn run_analytics_validate(
     _fix: bool,
     db_path_override: Option<&PathBuf>,
 ) -> CliResult<serde_json::Value> {
-    let lazy =
-        crate::storage::sqlite::LazyDb::from_overrides(&common.data_dir, db_path_override.cloned());
-    let conn = lazy
-        .get("analytics-validate")
-        .map_err(lazy_db_to_cli_error)?;
+    let conn = open_franken_analytics_db(&common.data_dir, db_path_override)?;
 
     let config = analytics::ValidateConfig::default();
     let report = analytics::validate::run_validation(&conn, &config);
@@ -3817,9 +3848,7 @@ fn run_analytics_models(
     group_by: AnalyticsBucketing,
     db_path_override: Option<&PathBuf>,
 ) -> CliResult<serde_json::Value> {
-    let lazy =
-        crate::storage::sqlite::LazyDb::from_overrides(&common.data_dir, db_path_override.cloned());
-    let conn = lazy.get("analytics-models").map_err(lazy_db_to_cli_error)?;
+    let conn = open_franken_analytics_db(&common.data_dir, db_path_override)?;
     let filter = analytics::AnalyticsFilter::from(common);
     let db_err = |e: crate::analytics::AnalyticsError| CliError {
         code: 9,
@@ -4040,24 +4069,30 @@ fn state_meta_json(
     let mut last_indexed_at: Option<i64> = None;
     let mut db_opened = false;
 
-    // Use LazyDb to get timing/logging for state snapshot DB access
-    let lazy = crate::storage::sqlite::LazyDb::new(db_path.to_path_buf());
+    // Use LazyFrankenDb to get timing/logging for state snapshot DB access
+    let lazy = crate::storage::sqlite::LazyFrankenDb::new(db_path.to_path_buf());
     if allow_db_open
         && db_exists
         && let Ok(conn) = lazy.get("state-meta")
     {
+        use frankensqlite::compat::{ConnectionExt, RowExt};
+        use frankensqlite::params;
         db_opened = true;
         conversation_count = conn
-            .query_row("SELECT COUNT(*) FROM conversations", [], |r| r.get(0))
+            .query_row_map("SELECT COUNT(*) FROM conversations", params![], |r| {
+                r.get_typed(0)
+            })
             .unwrap_or(0);
         message_count = conn
-            .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
+            .query_row_map("SELECT COUNT(*) FROM messages", params![], |r| {
+                r.get_typed(0)
+            })
             .unwrap_or(0);
         last_indexed_at = conn
-            .query_row(
+            .query_row_map(
                 "SELECT value FROM meta WHERE key = 'last_indexed_at'",
-                [],
-                |r| r.get::<_, String>(0),
+                params![],
+                |r| r.get_typed::<String>(0),
             )
             .ok()
             .and_then(|s| s.parse::<i64>().ok());
@@ -4297,6 +4332,13 @@ fn lazy_db_to_cli_error(e: crate::storage::sqlite::LazyDbError) -> CliError {
             retryable: true,
         },
         LazyDbError::OpenFailed { path, source } => CliError {
+            code: 9,
+            kind: "db-open",
+            message: format!("Failed to open database at {}: {source}", path.display()),
+            hint: None,
+            retryable: false,
+        },
+        LazyDbError::FrankenOpenFailed { path, source } => CliError {
             code: 9,
             kind: "db-open",
             message: format!("Failed to open database at {}: {source}", path.display()),
@@ -5096,6 +5138,8 @@ pub struct SemanticSearchOptions {
     pub use_daemon: bool,
     /// Use approximate nearest neighbor search when available
     pub approximate: bool,
+    /// Optional two-tier execution strategy for semantic mode.
+    pub tier_mode: crate::search::query::SemanticTierMode,
 }
 
 impl TimeFilter {
@@ -5338,6 +5382,12 @@ fn run_cli_search(
         semantic_opts.approximate
     };
 
+    if semantic_opts.tier_mode != crate::search::query::SemanticTierMode::Single
+        && !matches!(effective_mode, SearchMode::Semantic)
+    {
+        eprintln!("Warning: tier flags currently only affect --mode semantic.");
+    }
+
     if matches!(effective_mode, SearchMode::Semantic | SearchMode::Hybrid) {
         use crate::search::embedder_registry::{EmbedderRegistry, HASH_EMBEDDER};
 
@@ -5571,6 +5621,7 @@ fn run_cli_search(
         || semantic_opts.reranker.is_some()
         || semantic_opts.use_daemon
         || semantic_opts.approximate
+        || semantic_opts.tier_mode != crate::search::query::SemanticTierMode::Single
     {
         tracing::debug!(
             model = ?semantic_opts.model,
@@ -5578,6 +5629,7 @@ fn run_cli_search(
             reranker = ?semantic_opts.reranker,
             use_daemon = semantic_opts.use_daemon,
             approximate = semantic_opts.approximate,
+            tier_mode = ?semantic_opts.tier_mode,
             "Semantic search options configured"
         );
     }
@@ -5603,13 +5655,14 @@ fn run_cli_search(
             })?,
         SearchMode::Semantic => {
             let (hits, ann_stats) = client
-                .search_semantic(
+                .search_semantic_with_tier(
                     query,
                     filters.clone(),
                     search_limit,
                     search_offset,
                     field_mask,
                     approximate,
+                    semantic_opts.tier_mode,
                 )
                 .map_err(|e| {
                     let err_str = e.to_string();
@@ -7285,7 +7338,10 @@ fn run_stats(
 ) -> CliResult<()> {
     use crate::sources::provenance::SourceFilter;
 
-    let lazy = crate::storage::sqlite::LazyDb::from_overrides(data_dir_override, db_override);
+    use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
+
+    let lazy =
+        crate::storage::sqlite::LazyFrankenDb::from_overrides(data_dir_override, db_override);
     let conn = lazy.get("stats").map_err(lazy_db_to_cli_error)?;
 
     // Parse source filter (P3.7)
@@ -7301,88 +7357,53 @@ fn run_stats(
         }
     };
 
-    // Get counts and statistics with source filter
-    let conversation_count: i64 = if let Some(ref param) = source_param {
-        conn.query_row(
-            &format!("SELECT COUNT(*) FROM conversations c{source_where}"),
-            [param],
-            |r| r.get(0),
-        )
-    } else {
-        conn.query_row(
-            &format!("SELECT COUNT(*) FROM conversations c{source_where}"),
-            [],
-            |r| r.get(0),
-        )
-    }
-    .unwrap_or(0);
+    // Helper: build params slice from optional source param
+    let make_params = |param: &Option<String>| -> Vec<ParamValue> {
+        match param {
+            Some(p) => vec![ParamValue::from(p.as_str())],
+            None => vec![],
+        }
+    };
 
-    let message_count: i64 = if let Some(ref param) = source_param {
-        conn.query_row(
+    // Get counts and statistics with source filter
+    let params = make_params(&source_param);
+    let conversation_count: i64 = conn
+        .query_row_map(
+            &format!("SELECT COUNT(*) FROM conversations c{source_where}"),
+            &params,
+            |r| r.get_typed(0),
+        )
+        .unwrap_or(0);
+
+    let message_count: i64 = conn
+        .query_row_map(
             &format!(
                 "SELECT COUNT(*) FROM messages m JOIN conversations c ON m.conversation_id = c.id{source_where}"
             ),
-            [param],
-            |r| r.get(0),
+            &params,
+            |r| r.get_typed(0),
         )
-    } else {
-        conn.query_row(
-            &format!(
-                "SELECT COUNT(*) FROM messages m JOIN conversations c ON m.conversation_id = c.id{source_where}"
-            ),
-            [],
-            |r| r.get(0),
-        )
-    }
-    .unwrap_or(0);
+        .unwrap_or(0);
 
     // Get per-agent breakdown with source filter
     let agent_sql = format!(
         "SELECT a.slug, COUNT(*) FROM conversations c JOIN agents a ON c.agent_id = a.id{source_where} GROUP BY a.slug ORDER BY COUNT(*) DESC"
     );
-    let agent_rows: Vec<(String, i64)> = if let Some(ref param) = source_param {
-        let mut stmt = conn
-            .prepare(&agent_sql)
-            .map_err(|e| CliError::unknown(format!("query prep: {e}")))?;
-        stmt.query_map([param], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+    let agent_rows: Vec<(String, i64)> = conn
+        .query_map_collect(&agent_sql, &params, |r| {
+            Ok((r.get_typed::<String>(0)?, r.get_typed::<i64>(1)?))
         })
-        .map_err(|e| CliError::unknown(format!("query: {e}")))?
-        .filter_map(std::result::Result::ok)
-        .collect()
-    } else {
-        let mut stmt = conn
-            .prepare(&agent_sql)
-            .map_err(|e| CliError::unknown(format!("query prep: {e}")))?;
-        stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
-            .map_err(|e| CliError::unknown(format!("query: {e}")))?
-            .filter_map(std::result::Result::ok)
-            .collect()
-    };
+        .map_err(|e| CliError::unknown(format!("query: {e}")))?;
 
     // Get workspace breakdown with source filter (top 10)
     let ws_sql = format!(
         "SELECT w.path, COUNT(*) FROM conversations c JOIN workspaces w ON c.workspace_id = w.id{source_where} GROUP BY w.path ORDER BY COUNT(*) DESC LIMIT 10"
     );
-    let ws_rows: Vec<(String, i64)> = if let Some(ref param) = source_param {
-        let mut stmt = conn
-            .prepare(&ws_sql)
-            .map_err(|e| CliError::unknown(format!("query prep: {e}")))?;
-        stmt.query_map([param], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+    let ws_rows: Vec<(String, i64)> = conn
+        .query_map_collect(&ws_sql, &params, |r| {
+            Ok((r.get_typed::<String>(0)?, r.get_typed::<i64>(1)?))
         })
-        .map_err(|e| CliError::unknown(format!("query: {e}")))?
-        .filter_map(std::result::Result::ok)
-        .collect()
-    } else {
-        let mut stmt = conn
-            .prepare(&ws_sql)
-            .map_err(|e| CliError::unknown(format!("query prep: {e}")))?;
-        stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
-            .map_err(|e| CliError::unknown(format!("query: {e}")))?
-            .filter_map(std::result::Result::ok)
-            .collect()
-    };
+        .map_err(|e| CliError::unknown(format!("query: {e}")))?;
 
     // Get date range with source filter.
     // Note: source_where already includes a leading " WHERE ...", so when it is present we must
@@ -7395,13 +7416,11 @@ fn run_stats(
             "SELECT MIN(started_at), MAX(started_at) FROM conversations c{source_where} AND started_at IS NOT NULL"
         )
     };
-    let (oldest, newest): (Option<i64>, Option<i64>) = if let Some(ref param) = source_param {
-        conn.query_row(&date_sql, [param], |r| Ok((r.get(0)?, r.get(1)?)))
-            .unwrap_or((None, None))
-    } else {
-        conn.query_row(&date_sql, [], |r| Ok((r.get(0)?, r.get(1)?)))
-            .unwrap_or((None, None))
-    };
+    let (oldest, newest): (Option<i64>, Option<i64>) = conn
+        .query_row_map(&date_sql, &params, |r| {
+            Ok((r.get_typed(0)?, r.get_typed(1)?))
+        })
+        .unwrap_or((None, None));
 
     // Get per-source breakdown if requested (P3.7)
     let source_rows: Vec<(String, i64, i64)> = if by_source {
@@ -7413,32 +7432,14 @@ fn run_stats(
              GROUP BY c.source_id
              ORDER BY convs DESC"
         );
-        let mut stmt = conn
-            .prepare(&source_sql)
-            .map_err(|e| CliError::unknown(format!("query prep: {e}")))?;
-        if let Some(ref param) = source_param {
-            stmt.query_map([param], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, i64>(1)?,
-                    r.get::<_, i64>(2)?,
-                ))
-            })
-            .map_err(|e| CliError::unknown(format!("query: {e}")))?
-            .filter_map(std::result::Result::ok)
-            .collect()
-        } else {
-            stmt.query_map([], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, i64>(1)?,
-                    r.get::<_, i64>(2)?,
-                ))
-            })
-            .map_err(|e| CliError::unknown(format!("query: {e}")))?
-            .filter_map(std::result::Result::ok)
-            .collect()
-        }
+        conn.query_map_collect(&source_sql, &params, |r| {
+            Ok((
+                r.get_typed::<String>(0)?,
+                r.get_typed::<i64>(1)?,
+                r.get_typed::<i64>(2)?,
+            ))
+        })
+        .map_err(|e| CliError::unknown(format!("query: {e}")))?
     } else {
         Vec::new()
     };
@@ -7553,7 +7554,9 @@ fn run_diag(
     json: bool,
     verbose: bool,
 ) -> CliResult<()> {
-    use rusqlite::Connection;
+    use frankensqlite::Connection;
+    use frankensqlite::compat::{ConnectionExt, RowExt};
+    use frankensqlite::params;
     use std::fs;
 
     let version = env!("CARGO_PKG_VERSION");
@@ -7566,17 +7569,22 @@ fn run_diag(
     // Check database existence and get stats
     let (db_exists, db_size, conversation_count, message_count) = if db_path.exists() {
         let size = fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
-        let (convs, msgs) = if let Ok(conn) = Connection::open(&db_path) {
-            let convs: i64 = conn
-                .query_row("SELECT COUNT(*) FROM conversations", [], |r| r.get(0))
-                .unwrap_or(0);
-            let msgs: i64 = conn
-                .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
-                .unwrap_or(0);
-            (convs, msgs)
-        } else {
-            (0, 0)
-        };
+        let (convs, msgs) =
+            if let Ok(conn) = Connection::open(db_path.to_string_lossy().into_owned()) {
+                let convs: i64 = conn
+                    .query_row_map("SELECT COUNT(*) FROM conversations", params![], |r| {
+                        r.get_typed(0)
+                    })
+                    .unwrap_or(0);
+                let msgs: i64 = conn
+                    .query_row_map("SELECT COUNT(*) FROM messages", params![], |r| {
+                        r.get_typed(0)
+                    })
+                    .unwrap_or(0);
+                (convs, msgs)
+            } else {
+                (0, 0)
+            };
         (true, size, convs, msgs)
     } else {
         (false, 0, 0, 0)
@@ -7833,7 +7841,9 @@ fn run_status(
     stale_threshold: u64,
     _robot_meta: bool,
 ) -> CliResult<()> {
-    use rusqlite::Connection;
+    use frankensqlite::Connection;
+    use frankensqlite::compat::{ConnectionExt, RowExt};
+    use frankensqlite::params;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     let data_dir = data_dir_override.clone().unwrap_or_else(default_data_dir);
@@ -7858,21 +7868,25 @@ fn run_status(
     let mut message_count: i64 = 0;
     let mut last_indexed_at: Option<i64> = None;
 
-    if db_exists && let Ok(conn) = Connection::open(&db_path) {
+    if db_exists && let Ok(conn) = Connection::open(db_path.to_string_lossy().into_owned()) {
         // Get counts
         conversation_count = conn
-            .query_row("SELECT COUNT(*) FROM conversations", [], |r| r.get(0))
+            .query_row_map("SELECT COUNT(*) FROM conversations", params![], |r| {
+                r.get_typed(0)
+            })
             .unwrap_or(0);
         message_count = conn
-            .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
+            .query_row_map("SELECT COUNT(*) FROM messages", params![], |r| {
+                r.get_typed(0)
+            })
             .unwrap_or(0);
 
         // Get last indexed timestamp from meta table
         last_indexed_at = conn
-            .query_row(
+            .query_row_map(
                 "SELECT value FROM meta WHERE key = 'last_indexed_at'",
-                [],
-                |r| r.get::<_, String>(0),
+                params![],
+                |r| r.get_typed::<String>(0),
             )
             .ok()
             .and_then(|s| s.parse::<i64>().ok());
@@ -9252,27 +9266,28 @@ fn run_context(
     json: bool,
     limit: usize,
 ) -> CliResult<()> {
-    let lazy = crate::storage::sqlite::LazyDb::from_overrides(data_dir_override, db_override);
-    let conn = lazy.get("context").map_err(lazy_db_to_cli_error)?;
+    use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
+
+    let conn = open_franken_analytics_db(data_dir_override, db_override.as_ref())?;
 
     // Find the source conversation by path (normalized to string)
     let path_str = path.to_string_lossy().to_string();
     #[allow(clippy::type_complexity)]
     let source_conv: Option<(i64, i64, Option<i64>, Option<i64>, String, String)> = conn
-        .query_row(
+        .query_row_map(
             "SELECT c.id, c.agent_id, c.workspace_id, c.started_at, c.title, a.slug
              FROM conversations c
              JOIN agents a ON c.agent_id = a.id
-             WHERE c.source_path = ?1",
-            [&path_str],
-            |r: &rusqlite::Row| {
+             WHERE c.source_path = ?",
+            &[ParamValue::from(path_str.as_str())],
+            |r: &frankensqlite::Row| {
                 Ok((
-                    r.get(0)?,
-                    r.get(1)?,
-                    r.get(2)?,
-                    r.get(3)?,
-                    r.get::<_, Option<String>>(4)?.unwrap_or_default(),
-                    r.get(5)?,
+                    r.get_typed(0)?,
+                    r.get_typed(1)?,
+                    r.get_typed(2)?,
+                    r.get_typed(3)?,
+                    r.get_typed::<Option<String>>(4)?.unwrap_or_default(),
+                    r.get_typed(5)?,
                 ))
             },
         )
@@ -9293,10 +9308,10 @@ fn run_context(
 
     // Get workspace path for display
     let workspace_path: Option<String> = workspace_id.and_then(|ws_id: i64| {
-        conn.query_row(
-            "SELECT path FROM workspaces WHERE id = ?1",
-            [ws_id],
-            |r: &rusqlite::Row| r.get::<_, String>(0),
+        conn.query_row_map(
+            "SELECT path FROM workspaces WHERE id = ?",
+            &[ParamValue::from(ws_id)],
+            |r: &frankensqlite::Row| r.get_typed(0),
         )
         .ok()
     });
@@ -9304,27 +9319,28 @@ fn run_context(
     // Find related sessions: same workspace (excluding self)
     let same_workspace: Vec<(String, String, String, Option<i64>)> =
         if let Some(ws_id) = workspace_id {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT c.source_path, c.title, a.slug, c.started_at
+            conn.query_map_collect(
+                "SELECT c.source_path, c.title, a.slug, c.started_at
                  FROM conversations c
                  JOIN agents a ON c.agent_id = a.id
-                 WHERE c.workspace_id = ?1 AND c.id != ?2
+                 WHERE c.workspace_id = ? AND c.id != ?
                  ORDER BY c.started_at DESC
-                 LIMIT ?3",
-                )
-                .map_err(|e| CliError::unknown(format!("query prep: {e}")))?;
-            stmt.query_map([ws_id, conv_id, limit as i64], |r: &rusqlite::Row| {
-                Ok((
-                    r.get(0)?,
-                    r.get::<_, Option<String>>(1)?.unwrap_or_default(),
-                    r.get(2)?,
-                    r.get(3)?,
-                ))
-            })
+                 LIMIT ?",
+                &[
+                    ParamValue::from(ws_id),
+                    ParamValue::from(conv_id),
+                    ParamValue::from(limit as i64),
+                ],
+                |r: &frankensqlite::Row| {
+                    Ok((
+                        r.get_typed(0)?,
+                        r.get_typed::<Option<String>>(1)?.unwrap_or_default(),
+                        r.get_typed(2)?,
+                        r.get_typed(3)?,
+                    ))
+                },
+            )
             .map_err(|e| CliError::unknown(format!("query: {e}")))?
-            .filter_map(std::result::Result::ok)
-            .collect()
         } else {
             Vec::new()
         };
@@ -9333,55 +9349,55 @@ fn run_context(
     let same_day: Vec<(String, String, String, Option<i64>)> = if let Some(ts) = started_at {
         let day_start = ts - (ts % 86_400_000); // Start of day in milliseconds
         let day_end = day_start + 86_400_000;
-        let mut stmt = conn
-            .prepare(
-                "SELECT c.source_path, c.title, a.slug, c.started_at
+        conn.query_map_collect(
+            "SELECT c.source_path, c.title, a.slug, c.started_at
                  FROM conversations c
                  JOIN agents a ON c.agent_id = a.id
-                 WHERE c.started_at >= ?1 AND c.started_at < ?2 AND c.id != ?3
+                 WHERE c.started_at >= ? AND c.started_at < ? AND c.id != ?
                  ORDER BY c.started_at DESC
-                 LIMIT ?4",
-            )
-            .map_err(|e| CliError::unknown(format!("query prep: {e}")))?;
-        stmt.query_map(
-            [day_start, day_end, conv_id, limit as i64],
-            |r: &rusqlite::Row| {
+                 LIMIT ?",
+            &[
+                ParamValue::from(day_start),
+                ParamValue::from(day_end),
+                ParamValue::from(conv_id),
+                ParamValue::from(limit as i64),
+            ],
+            |r: &frankensqlite::Row| {
                 Ok((
-                    r.get(0)?,
-                    r.get::<_, Option<String>>(1)?.unwrap_or_default(),
-                    r.get(2)?,
-                    r.get(3)?,
+                    r.get_typed(0)?,
+                    r.get_typed::<Option<String>>(1)?.unwrap_or_default(),
+                    r.get_typed(2)?,
+                    r.get_typed(3)?,
                 ))
             },
         )
         .map_err(|e| CliError::unknown(format!("query: {e}")))?
-        .filter_map(std::result::Result::ok)
-        .collect()
     } else {
         Vec::new()
     };
 
     // Find related sessions: same agent (excluding self)
     let same_agent: Vec<(String, String, Option<i64>)> = {
-        let mut stmt = conn
-            .prepare(
-                "SELECT c.source_path, c.title, c.started_at
+        conn.query_map_collect(
+            "SELECT c.source_path, c.title, c.started_at
                  FROM conversations c
-                 WHERE c.agent_id = ?1 AND c.id != ?2
+                 WHERE c.agent_id = ? AND c.id != ?
                  ORDER BY c.started_at DESC
-                 LIMIT ?3",
-            )
-            .map_err(|e| CliError::unknown(format!("query prep: {e}")))?;
-        stmt.query_map([agent_id, conv_id, limit as i64], |r: &rusqlite::Row| {
-            Ok((
-                r.get(0)?,
-                r.get::<_, Option<String>>(1)?.unwrap_or_default(),
-                r.get(2)?,
-            ))
-        })
+                 LIMIT ?",
+            &[
+                ParamValue::from(agent_id),
+                ParamValue::from(conv_id),
+                ParamValue::from(limit as i64),
+            ],
+            |r: &frankensqlite::Row| {
+                Ok((
+                    r.get_typed(0)?,
+                    r.get_typed::<Option<String>>(1)?.unwrap_or_default(),
+                    r.get_typed(2)?,
+                ))
+            },
+        )
         .map_err(|e| CliError::unknown(format!("query: {e}")))?
-        .filter_map(std::result::Result::ok)
-        .collect()
     };
 
     let structured_format = if json {
@@ -14103,13 +14119,13 @@ fn run_timeline(
 ) -> CliResult<()> {
     use crate::sources::provenance::SourceFilter;
     use chrono::{Local, TimeZone, Utc};
+    use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
     use std::collections::HashMap;
 
     // Parse source filter (P3.2)
     let source_filter = source.as_ref().map(|s| SourceFilter::parse(s));
 
-    let lazy = crate::storage::sqlite::LazyDb::from_overrides(data_dir, db_override);
-    let conn = lazy.get("timeline").map_err(lazy_db_to_cli_error)?;
+    let conn = open_franken_analytics_db(data_dir, db_override.as_ref())?;
 
     let now = Local::now();
     let (start_ts, end_ts) = if today {
@@ -14140,7 +14156,7 @@ fn run_timeline(
          WHERE c.started_at >= ?1 AND c.started_at <= ?2",
     );
 
-    let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(start_ts), Box::new(end_ts)];
+    let mut params: Vec<ParamValue> = vec![start_ts.into(), end_ts.into()];
 
     if !agents.is_empty() {
         sql.push_str(" AND a.slug IN (");
@@ -14149,7 +14165,7 @@ fn run_timeline(
                 sql.push_str(", ");
             }
             sql.push_str(&format!("?{}", params.len() + 1));
-            params.push(Box::new(agent.clone()));
+            params.push(agent.clone().into());
         }
         sql.push(')');
     }
@@ -14168,36 +14184,26 @@ fn run_timeline(
             }
             SourceFilter::SourceId(id) => {
                 sql.push_str(&format!(" AND c.source_id = ?{}", params.len() + 1));
-                params.push(Box::new(id.clone()));
+                params.push(id.clone().into());
             }
         }
     }
 
     sql.push_str(" GROUP BY c.id ORDER BY c.started_at DESC");
 
-    let mut stmt = conn.prepare(&sql).map_err(|e| CliError {
-        code: 9,
-        kind: "db-query",
-        message: format!("Query failed: {e}"),
-        hint: None,
-        retryable: false,
-    })?;
-
-    let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
-
-    let rows = stmt
-        .query_map(param_refs.as_slice(), |row| {
+    let rows = conn
+        .query_map_collect(&sql, &params, |row: &frankensqlite::Row| {
             Ok((
-                row.get::<_, i64>(0)?,            // id
-                row.get::<_, String>(1)?,         // agent
-                row.get::<_, Option<String>>(2)?, // title
-                row.get::<_, i64>(3)?,            // started_at
-                row.get::<_, Option<i64>>(4)?,    // ended_at
-                row.get::<_, String>(5)?,         // source_path
-                row.get::<_, i64>(6)?,            // message_count
-                row.get::<_, String>(7)?,         // source_id (P3.2)
-                row.get::<_, Option<String>>(8)?, // origin_host (P3.5)
-                row.get::<_, Option<String>>(9)?, // origin_kind (P3.5)
+                row.get_typed::<i64>(0)?,            // id
+                row.get_typed::<String>(1)?,         // agent
+                row.get_typed::<Option<String>>(2)?, // title
+                row.get_typed::<i64>(3)?,            // started_at
+                row.get_typed::<Option<i64>>(4)?,    // ended_at
+                row.get_typed::<String>(5)?,         // source_path
+                row.get_typed::<i64>(6)?,            // message_count
+                row.get_typed::<String>(7)?,         // source_id (P3.2)
+                row.get_typed::<Option<String>>(8)?, // origin_host (P3.5)
+                row.get_typed::<Option<String>>(9)?, // origin_kind (P3.5)
             ))
         })
         .map_err(|e| CliError {
@@ -14207,9 +14213,8 @@ fn run_timeline(
             hint: None,
             retryable: false,
         })?;
-
     #[allow(clippy::type_complexity)]
-    let mut sessions: Vec<(
+    let sessions: Vec<(
         i64,
         String,
         Option<String>,
@@ -14220,10 +14225,7 @@ fn run_timeline(
         String,
         Option<String>,
         Option<String>,
-    )> = Vec::new();
-    for r in rows.flatten() {
-        sessions.push(r);
-    }
+    )> = rows;
 
     let structured_format = if json {
         Some(RobotFormat::Json)

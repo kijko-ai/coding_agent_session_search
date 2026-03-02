@@ -12486,7 +12486,9 @@ impl TantivySearchService {
 
 impl SearchService for TantivySearchService {
     fn execute(&self, params: &SearchParams) -> Result<SearchResult, String> {
-        use crate::search::query::{FieldMask, SearchResult as BackendSearchResult};
+        use crate::search::query::{
+            FieldMask, SearchResult as BackendSearchResult, SemanticTierMode,
+        };
 
         let started = Instant::now();
         let limit = params.limit;
@@ -12511,6 +12513,10 @@ impl SearchService for TantivySearchService {
 
         let sparse_threshold = 3;
         let field_mask = FieldMask::new(true, true, true, true);
+        let tui_tier_mode = dotenvy::var("CASS_TUI_TWO_TIER")
+            .ok()
+            .filter(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+            .map_or(SemanticTierMode::Single, |_| SemanticTierMode::Progressive);
 
         let execute_mode = |mode: SearchMode| -> Result<BackendSearchResult, String> {
             match mode {
@@ -12528,13 +12534,14 @@ impl SearchService for TantivySearchService {
                 SearchMode::Semantic => {
                     let (hits, ann_stats) = self
                         .client
-                        .search_semantic(
+                        .search_semantic_with_tier(
                             &params.query,
                             params.filters.clone(),
                             limit,
                             offset,
                             field_mask,
                             false,
+                            tui_tier_mode,
                         )
                         .map_err(|e| e.to_string())?;
                     Ok(crate::search::query::SearchResult {
@@ -16965,7 +16972,7 @@ impl super::ftui_adapter::Model for CassApp {
                 #[cfg(not(test))]
                 {
                     ftui::Cmd::task(move || {
-                        match crate::storage::sqlite::SqliteStorage::open_readonly(&db_path) {
+                        match crate::storage::sqlite::FrankenStorage::open_readonly(&db_path) {
                             Ok(db) => {
                                 let mut data = super::analytics_charts::load_chart_data(
                                     &db, &filters, group_by,
@@ -16995,15 +17002,26 @@ impl super::ftui_adapter::Model for CassApp {
                                 };
 
                                 if should_auto_rebuild {
+                                    // rebuild_analytics() requires rusqlite SqliteStorage
                                     match crate::storage::sqlite::SqliteStorage::open(&db_path) {
                                         Ok(mut db_rw) => match db_rw.rebuild_analytics() {
                                             Ok(_) => {
-                                                let mut refreshed =
-                                                    super::analytics_charts::load_chart_data(
-                                                        &db_rw, &filters, group_by,
-                                                    );
-                                                refreshed.auto_rebuilt = true;
-                                                data = refreshed;
+                                                // Re-open with FrankenStorage to load refreshed data
+                                                match crate::storage::sqlite::FrankenStorage::open_readonly(&db_path) {
+                                                    Ok(db_refreshed) => {
+                                                        let mut refreshed =
+                                                            super::analytics_charts::load_chart_data(
+                                                                &db_refreshed, &filters, group_by,
+                                                            );
+                                                        refreshed.auto_rebuilt = true;
+                                                        data = refreshed;
+                                                    }
+                                                    Err(err) => {
+                                                        data.auto_rebuild_error = Some(format!(
+                                                            "failed re-opening analytics DB after rebuild: {err}"
+                                                        ));
+                                                    }
+                                                }
                                             }
                                             Err(err) => {
                                                 data.auto_rebuild_error = Some(format!(

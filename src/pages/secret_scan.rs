@@ -1,9 +1,9 @@
 use anyhow::{Context, Result, bail};
 use console::{Term, style};
+use frankensqlite::compat::{OpenFlags, ParamValue, RowExt, open_with_flags, params_from_iter};
 use indicatif::{ProgressBar, ProgressStyle};
 use once_cell::sync::Lazy;
 use regex::Regex;
-use frankensqlite::compat::{OpenFlags, ParamValue, RowExt, open_with_flags, params_from_iter};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
@@ -844,9 +844,7 @@ fn is_allowlisted(matched: &str, config: &SecretScanConfig) -> bool {
     false
 }
 
-fn build_where_clause(
-    filters: &SecretScanFilters,
-) -> Result<(String, Vec<ParamValue>)> {
+fn build_where_clause(filters: &SecretScanFilters) -> Result<(String, Vec<ParamValue>)> {
     let mut conditions: Vec<String> = Vec::new();
     let mut params: Vec<ParamValue> = Vec::new();
 

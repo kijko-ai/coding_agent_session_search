@@ -9,7 +9,9 @@
 //! Output is a structured [`ValidationReport`] that serialises to JSON
 //! for `cass analytics validate --json`.
 
-use rusqlite::Connection;
+use frankensqlite::Connection;
+use frankensqlite::Row;
+use frankensqlite::compat::{ConnectionExt, RowExt};
 use serde::Serialize;
 
 use super::query::table_exists;
@@ -215,8 +217,8 @@ fn validate_track_a(conn: &Connection, config: &ValidateConfig) -> (Vec<Check>, 
 
     // Get all distinct (day_id, agent_slug, workspace_id, source_id) buckets in usage_daily.
     let total_buckets: usize = conn
-        .query_row("SELECT COUNT(*) FROM usage_daily", [], |r| {
-            r.get::<_, i64>(0).map(|v| v as usize)
+        .query_row_map("SELECT COUNT(*) FROM usage_daily", &[], |r: &Row| {
+            r.get_typed::<i64>(0).map(|v| v as usize)
         })
         .unwrap_or(0);
 
@@ -278,23 +280,21 @@ fn validate_track_a(conn: &Connection, config: &ValidateConfig) -> (Vec<Check>, 
     let mut mismatches_api_cov = 0_usize;
     let mut checked = 0_usize;
 
-    if let Ok(mut stmt) = conn.prepare(&sql)
-        && let Ok(rows) = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,    // day_id
-                row.get::<_, String>(1)?, // agent_slug
-                row.get::<_, i64>(4)?,    // ud.content_tokens_est_total
-                row.get::<_, i64>(5)?,    // mm.sum_content
-                row.get::<_, i64>(6)?,    // ud.message_count
-                row.get::<_, i64>(7)?,    // mm.sum_msgs
-                row.get::<_, i64>(8)?,    // ud.api_tokens_total
-                row.get::<_, i64>(9)?,    // mm.sum_api
-                row.get::<_, i64>(10)?,   // ud.api_coverage_message_count
-                row.get::<_, i64>(11)?,   // mm.sum_api_coverage
-            ))
-        })
-    {
-        for row in rows.flatten() {
+    if let Ok(rows) = conn.query_map_collect(&sql, &[], |row: &Row| {
+        Ok((
+            row.get_typed::<i64>(0)?,    // day_id
+            row.get_typed::<String>(1)?, // agent_slug
+            row.get_typed::<i64>(4)?,    // ud.content_tokens_est_total
+            row.get_typed::<i64>(5)?,    // mm.sum_content
+            row.get_typed::<i64>(6)?,    // ud.message_count
+            row.get_typed::<i64>(7)?,    // mm.sum_msgs
+            row.get_typed::<i64>(8)?,    // ud.api_tokens_total
+            row.get_typed::<i64>(9)?,    // mm.sum_api
+            row.get_typed::<i64>(10)?,   // ud.api_coverage_message_count
+            row.get_typed::<i64>(11)?,   // mm.sum_api_coverage
+        ))
+    }) {
+        for row in rows {
             checked += 1;
             let (
                 _day_id,
@@ -428,8 +428,8 @@ fn validate_track_b(conn: &Connection, config: &ValidateConfig) -> (Vec<Check>, 
     });
 
     let total_buckets: usize = conn
-        .query_row("SELECT COUNT(*) FROM token_daily_stats", [], |r| {
-            r.get::<_, i64>(0).map(|v| v as usize)
+        .query_row_map("SELECT COUNT(*) FROM token_daily_stats", &[], |r: &Row| {
+            r.get_typed::<i64>(0).map(|v| v as usize)
         })
         .unwrap_or(0);
 
@@ -498,17 +498,15 @@ fn validate_track_b(conn: &Connection, config: &ValidateConfig) -> (Vec<Check>, 
     let mut mismatches_tools = 0_usize;
     let mut checked = 0_usize;
 
-    if let Ok(mut stmt) = conn.prepare(&sql)
-        && let Ok(rows) = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, i64>(4)?, // tds.grand_total_tokens
-                row.get::<_, i64>(5)?, // tu.sum_total
-                row.get::<_, i64>(6)?, // tds.total_tool_calls
-                row.get::<_, i64>(7)?, // tu.sum_tools
-            ))
-        })
-    {
-        for row in rows.flatten() {
+    if let Ok(rows) = conn.query_map_collect(&sql, &[], |row: &Row| {
+        Ok((
+            row.get_typed::<i64>(4)?, // tds.grand_total_tokens
+            row.get_typed::<i64>(5)?, // tu.sum_total
+            row.get_typed::<i64>(6)?, // tds.total_tool_calls
+            row.get_typed::<i64>(7)?, // tu.sum_tools
+        ))
+    }) {
+        for row in rows {
             checked += 1;
             let (tds_total, tu_total, tds_tools, tu_tools) = row;
             if tds_total != tu_total {
@@ -641,19 +639,16 @@ fn validate_cross_track_drift(
     let mut drift_checked = 0_usize;
 
     // Try compatible SQL (UNION-based).
-    let query_result = conn.prepare(&sql_compat);
-    if let Ok(mut stmt) = query_result
-        && let Ok(rows) = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,    // day_id
-                row.get::<_, String>(1)?, // agent_slug
-                row.get::<_, String>(2)?, // source_id
-                row.get::<_, i64>(3)?,    // a_total
-                row.get::<_, i64>(4)?,    // b_total
-            ))
-        })
-    {
-        for row in rows.flatten() {
+    if let Ok(rows) = conn.query_map_collect(&sql_compat, &[], |row: &Row| {
+        Ok((
+            row.get_typed::<i64>(0)?,    // day_id
+            row.get_typed::<String>(1)?, // agent_slug
+            row.get_typed::<String>(2)?, // source_id
+            row.get_typed::<i64>(3)?,    // a_total
+            row.get_typed::<i64>(4)?,    // b_total
+        ))
+    }) {
+        for row in rows {
             drift_checked += 1;
             let (day_id, agent_slug, source_id, a_total, b_total) = row;
             let delta = a_total - b_total;
@@ -684,19 +679,17 @@ fn validate_cross_track_drift(
                 });
             }
         }
-    } else if let Ok(mut stmt) = conn.prepare(&sql)
-        && let Ok(rows) = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, i64>(3)?,
-                row.get::<_, i64>(4)?,
-            ))
-        })
-    {
+    } else if let Ok(rows) = conn.query_map_collect(&sql, &[], |row: &Row| {
+        Ok((
+            row.get_typed::<i64>(0)?,
+            row.get_typed::<String>(1)?,
+            row.get_typed::<String>(2)?,
+            row.get_typed::<i64>(3)?,
+            row.get_typed::<i64>(4)?,
+        ))
+    }) {
         // Fallback: FULL OUTER JOIN (if UNION approach failed).
-        for row in rows.flatten() {
+        for row in rows {
             drift_checked += 1;
             let (day_id, agent_slug, source_id, a_total, b_total) = row;
             let delta = a_total - b_total;
@@ -767,7 +760,9 @@ fn validate_non_negative_counters(conn: &Connection) -> Vec<Check> {
             .collect::<Vec<_>>()
             .join(" OR ");
         let sql = format!("SELECT COUNT(*) FROM usage_daily WHERE {cond}");
-        let negative_rows: i64 = conn.query_row(&sql, [], |r| r.get(0)).unwrap_or(0);
+        let negative_rows: i64 = conn
+            .query_row_map(&sql, &[], |r: &Row| r.get_typed(0))
+            .unwrap_or(0);
 
         checks.push(Check {
             id: "track_a.non_negative_counters".into(),
@@ -789,10 +784,10 @@ fn validate_non_negative_counters(conn: &Connection) -> Vec<Check> {
     // Track A: api_coverage_message_count <= message_count.
     if table_exists(conn, "usage_daily") {
         let bad: i64 = conn
-            .query_row(
+            .query_row_map(
                 "SELECT COUNT(*) FROM usage_daily WHERE api_coverage_message_count > message_count",
-                [],
-                |r| r.get(0),
+                &[],
+                |r: &Row| r.get_typed(0),
             )
             .unwrap_or(0);
 
@@ -830,7 +825,9 @@ fn validate_non_negative_counters(conn: &Connection) -> Vec<Check> {
             .collect::<Vec<_>>()
             .join(" OR ");
         let sql = format!("SELECT COUNT(*) FROM token_daily_stats WHERE {cond}");
-        let negative_rows: i64 = conn.query_row(&sql, [], |r| r.get(0)).unwrap_or(0);
+        let negative_rows: i64 = conn
+            .query_row_map(&sql, &[], |r: &Row| r.get_typed(0))
+            .unwrap_or(0);
 
         checks.push(Check {
             id: "track_b.non_negative_counters".into(),
@@ -876,7 +873,8 @@ pub fn perf_query_guardrail(conn: &Connection) -> PerfMeasurement {
         let sql = "SELECT COUNT(*) FROM (
             SELECT day_id, SUM(message_count) FROM usage_daily GROUP BY day_id
         )";
-        conn.query_row(sql, [], |r| r.get(0)).unwrap_or(0)
+        conn.query_row_map(sql, &[], |r: &Row| r.get_typed(0))
+            .unwrap_or(0)
     } else {
         0
     };
@@ -902,7 +900,8 @@ pub fn perf_breakdown_guardrail(conn: &Connection) -> PerfMeasurement {
             SELECT agent_slug, SUM(api_tokens_total)
             FROM usage_daily GROUP BY agent_slug
         )";
-        conn.query_row(sql, [], |r| r.get(0)).unwrap_or(0)
+        conn.query_row_map(sql, &[], |r: &Row| r.get_typed(0))
+            .unwrap_or(0)
     } else {
         0
     };
@@ -925,12 +924,13 @@ pub fn perf_breakdown_guardrail(conn: &Connection) -> PerfMeasurement {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use frankensqlite::compat::BatchExt;
 
     // -- Fixture helpers --
 
     /// Create a minimal Track A fixture (message_metrics + usage_daily).
     fn setup_track_a_fixture() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
+        let conn = Connection::open(":memory:").unwrap();
         conn.execute_batch(
             "CREATE TABLE message_metrics (
                 message_id INTEGER PRIMARY KEY,
@@ -1104,11 +1104,8 @@ mod tests {
         let conn = setup_track_a_fixture();
 
         // Inject drift: change usage_daily content_tokens_est_total.
-        conn.execute(
-            "UPDATE usage_daily SET content_tokens_est_total = 9999 WHERE day_id = 20254",
-            [],
-        )
-        .unwrap();
+        conn.execute("UPDATE usage_daily SET content_tokens_est_total = 9999 WHERE day_id = 20254")
+            .unwrap();
 
         let config = ValidateConfig::deep();
         let report = run_validation(&conn, &config);
@@ -1127,11 +1124,8 @@ mod tests {
         let conn = setup_track_a_fixture();
 
         // Inject drift: change message_count.
-        conn.execute(
-            "UPDATE usage_daily SET message_count = 999 WHERE day_id = 20254",
-            [],
-        )
-        .unwrap();
+        conn.execute("UPDATE usage_daily SET message_count = 999 WHERE day_id = 20254")
+            .unwrap();
 
         let config = ValidateConfig::deep();
         let report = run_validation(&conn, &config);
@@ -1163,14 +1157,11 @@ mod tests {
         let conn = setup_both_tracks_fixture();
 
         // Inject drift: delete token_usage row (Track B ledger).
-        conn.execute("DELETE FROM token_usage WHERE id = 1", [])
+        conn.execute("DELETE FROM token_usage WHERE id = 1")
             .unwrap();
         // Also zero out token_daily_stats to be consistent with the deletion.
-        conn.execute(
-            "UPDATE token_daily_stats SET grand_total_tokens = 0 WHERE day_id = 20254",
-            [],
-        )
-        .unwrap();
+        conn.execute("UPDATE token_daily_stats SET grand_total_tokens = 0 WHERE day_id = 20254")
+            .unwrap();
 
         let config = ValidateConfig::deep();
         let report = run_validation(&conn, &config);
@@ -1192,11 +1183,8 @@ mod tests {
         let conn = setup_track_a_fixture();
 
         // Inject negative counter.
-        conn.execute(
-            "UPDATE usage_daily SET tool_call_count = -5 WHERE day_id = 20254",
-            [],
-        )
-        .unwrap();
+        conn.execute("UPDATE usage_daily SET tool_call_count = -5 WHERE day_id = 20254")
+            .unwrap();
 
         let config = ValidateConfig::deep();
         let report = run_validation(&conn, &config);
@@ -1216,7 +1204,6 @@ mod tests {
         // Inject bad data: coverage > message count.
         conn.execute(
             "UPDATE usage_daily SET api_coverage_message_count = 999 WHERE day_id = 20254",
-            [],
         )
         .unwrap();
 
@@ -1233,7 +1220,7 @@ mod tests {
 
     #[test]
     fn empty_database_reports_missing_tables() {
-        let conn = Connection::open_in_memory().unwrap();
+        let conn = Connection::open(":memory:").unwrap();
         let config = ValidateConfig::default();
         let report = run_validation(&conn, &config);
 

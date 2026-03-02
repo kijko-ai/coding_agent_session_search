@@ -196,7 +196,7 @@ impl AnalyticsChartData {
 /// Gracefully returns empty data if the database is unavailable or tables
 /// are missing.
 pub fn load_chart_data(
-    db: &crate::storage::sqlite::SqliteStorage,
+    db: &crate::storage::sqlite::FrankenStorage,
     filters: &super::app::AnalyticsFilterState,
     group_by: crate::analytics::GroupBy,
 ) -> AnalyticsChartData {
@@ -431,17 +431,16 @@ pub fn load_chart_data(
 }
 
 fn resolve_workspace_filter_ids(
-    conn: &rusqlite::Connection,
+    conn: &frankensqlite::Connection,
     workspaces: &std::collections::HashSet<String>,
 ) -> Vec<i64> {
+    use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
+
     if workspaces.is_empty() {
         return Vec::new();
     }
 
     let mut ids = Vec::new();
-    let mut stmt = conn
-        .prepare("SELECT id FROM workspaces WHERE path = ?1")
-        .ok();
 
     for workspace in workspaces {
         if let Ok(id) = workspace.parse::<i64>()
@@ -450,9 +449,11 @@ fn resolve_workspace_filter_ids(
             ids.push(id);
         }
 
-        if let Some(stmt) = stmt.as_mut()
-            && let Ok(id) = stmt.query_row([workspace.as_str()], |row| row.get::<_, i64>(0))
-            && !ids.contains(&id)
+        if let Ok(id) = conn.query_row_map(
+            "SELECT id FROM workspaces WHERE path = ?1",
+            &[ParamValue::from(workspace.as_str())],
+            |row: &frankensqlite::Row| row.get_typed::<i64>(0),
+        ) && !ids.contains(&id)
         {
             ids.push(id);
         }
@@ -2862,10 +2863,12 @@ fn format_number(n: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use frankensqlite::compat::{BatchExt, ConnectionExt};
+    use frankensqlite::params;
 
     #[test]
     fn resolve_workspace_filter_ids_supports_paths_and_numeric_ids() {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let conn = frankensqlite::Connection::open(":memory:").unwrap();
         conn.execute_batch(
             "CREATE TABLE workspaces (
                 id INTEGER PRIMARY KEY,
@@ -2873,14 +2876,14 @@ mod tests {
             );",
         )
         .unwrap();
-        conn.execute(
+        conn.execute_params(
             "INSERT INTO workspaces (id, path) VALUES (?1, ?2)",
-            rusqlite::params![1_i64, "/workspace/one"],
+            params![1_i64, "/workspace/one"],
         )
         .unwrap();
-        conn.execute(
+        conn.execute_params(
             "INSERT INTO workspaces (id, path) VALUES (?1, ?2)",
-            rusqlite::params![2_i64, "/workspace/two"],
+            params![2_i64, "/workspace/two"],
         )
         .unwrap();
 
@@ -2899,7 +2902,7 @@ mod tests {
     fn load_chart_data_applies_workspace_path_filter() {
         let tmp = tempfile::TempDir::new().unwrap();
         let db_path = tmp.path().join("analytics_filters.db");
-        let storage = crate::storage::sqlite::SqliteStorage::open(&db_path).unwrap();
+        let storage = crate::storage::sqlite::FrankenStorage::open(&db_path).unwrap();
 
         let ws_a = storage
             .ensure_workspace(std::path::Path::new("/workspace/a"), None)
@@ -2913,20 +2916,20 @@ mod tests {
             .unwrap()
             .as_millis() as i64;
         let conn = storage.raw();
-        conn.execute(
+        conn.execute_params(
             "INSERT INTO usage_daily (
                 day_id, agent_slug, workspace_id, source_id,
                 message_count, tool_call_count, api_tokens_total, last_updated
              ) VALUES (?1, 'codex', ?2, 'local', 10, 2, 1000, ?3)",
-            rusqlite::params![20260220_i64, ws_a, now_ms],
+            params![20260220_i64, ws_a, now_ms],
         )
         .unwrap();
-        conn.execute(
+        conn.execute_params(
             "INSERT INTO usage_daily (
                 day_id, agent_slug, workspace_id, source_id,
                 message_count, tool_call_count, api_tokens_total, last_updated
              ) VALUES (?1, 'codex', ?2, 'local', 20, 4, 2000, ?3)",
-            rusqlite::params![20260220_i64, ws_b, now_ms],
+            params![20260220_i64, ws_b, now_ms],
         )
         .unwrap();
 

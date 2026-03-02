@@ -2099,12 +2099,196 @@ pub fn apply_workspace_rewrite(conv: &mut NormalizedConversation, root: &ScanRoo
 }
 
 pub mod persist {
-    use anyhow::Result;
+    use std::collections::HashMap;
+    use std::time::Duration;
+
+    use anyhow::{Context, Result, anyhow};
+    use frankensqlite::FrankenError;
+    use rayon::prelude::*;
 
     use crate::connectors::NormalizedConversation;
     use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole, Snippet};
     use crate::search::tantivy::TantivyIndex;
-    use crate::storage::sqlite::{IndexingCache, InsertOutcome, SqliteStorage};
+    use crate::storage::sqlite::{FrankenStorage, IndexingCache, InsertOutcome, SqliteStorage};
+
+    fn begin_concurrent_writes_enabled() -> bool {
+        dotenvy::var("CASS_INDEXER_BEGIN_CONCURRENT")
+            .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+            .unwrap_or(false)
+    }
+
+    fn begin_concurrent_retry_limit() -> usize {
+        dotenvy::var("CASS_INDEXER_BEGIN_CONCURRENT_RETRIES")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(6)
+    }
+
+    fn begin_concurrent_chunk_size() -> usize {
+        dotenvy::var("CASS_INDEXER_BEGIN_CONCURRENT_CHUNK_SIZE")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(32)
+    }
+
+    fn begin_concurrent_writer_cache_kib() -> i64 {
+        dotenvy::var("CASS_INDEXER_BEGIN_CONCURRENT_WRITER_CACHE_KIB")
+            .ok()
+            .and_then(|v| v.parse::<i64>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(4096)
+    }
+
+    fn apply_begin_concurrent_writer_tuning(storage: &FrankenStorage) {
+        let cache_kib = begin_concurrent_writer_cache_kib();
+        let pragma = format!("PRAGMA cache_size = -{cache_kib};");
+        if let Err(err) = storage.raw().execute(&pragma) {
+            tracing::debug!(
+                cache_kib,
+                error = %err,
+                "failed_to_apply_begin_concurrent_writer_cache_size"
+            );
+        }
+    }
+
+    fn transient_franken_error(err: &anyhow::Error) -> Option<&FrankenError> {
+        err.downcast_ref::<FrankenError>()
+            .or_else(|| err.root_cause().downcast_ref::<FrankenError>())
+    }
+
+    fn is_retryable_franken_error(err: &anyhow::Error) -> bool {
+        transient_franken_error(err).is_some_and(|inner| {
+            matches!(
+                inner,
+                FrankenError::Busy
+                    | FrankenError::BusyRecovery
+                    | FrankenError::BusySnapshot { .. }
+                    | FrankenError::WriteConflict { .. }
+                    | FrankenError::SerializationFailure { .. }
+            )
+        })
+    }
+
+    /// Retry wrapper for any retryable FrankenError (BusySnapshot, WriteConflict, etc.)
+    fn with_concurrent_retry<F, T>(max_retries: usize, mut f: F) -> Result<T>
+    where
+        F: FnMut() -> Result<T>,
+    {
+        let mut backoff_ms = 4_u64;
+        for attempt in 0..=max_retries {
+            match f() {
+                Ok(val) => return Ok(val),
+                Err(err) if attempt < max_retries && is_retryable_franken_error(&err) => {
+                    tracing::debug!(
+                        attempt = attempt + 1,
+                        max_retries,
+                        backoff_ms,
+                        error = %err,
+                        "begin_concurrent_retry"
+                    );
+                    std::thread::sleep(Duration::from_millis(backoff_ms));
+                    backoff_ms = (backoff_ms * 2).min(128);
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        Err(anyhow!("exhausted begin-concurrent retries"))
+    }
+
+    fn persist_conversations_batched_begin_concurrent(
+        db_path: &std::path::Path,
+        t_index: &mut TantivyIndex,
+        convs: &[NormalizedConversation],
+        force_tantivy_reindex: bool,
+    ) -> Result<()> {
+        let max_retries = begin_concurrent_retry_limit();
+        let chunk_size = begin_concurrent_chunk_size().min(convs.len().max(1));
+
+        let indexed_chunks: Vec<Result<Vec<(usize, InsertOutcome)>>> = convs
+            .par_chunks(chunk_size)
+            .enumerate()
+            .map(|(chunk_idx, chunk)| {
+                let franken = FrankenStorage::open_writer(db_path).with_context(|| {
+                    format!(
+                        "opening frankensqlite writer for begin-concurrent mode: {}",
+                        db_path.display()
+                    )
+                })?;
+                apply_begin_concurrent_writer_tuning(&franken);
+                let mut outcomes = Vec::with_capacity(chunk.len());
+                let mut agent_cache: HashMap<String, i64> = HashMap::new();
+                let mut workspace_cache: HashMap<std::path::PathBuf, i64> = HashMap::new();
+
+                for (offset, conv) in chunk.iter().enumerate() {
+                    let idx = chunk_idx * chunk_size + offset;
+
+                    // Wrap the entire ensure_agent + ensure_workspace +
+                    // insert_conversation_tree sequence in the retry loop, since
+                    // ensure_agent/workspace also write and can hit page conflicts.
+                    let agent_slug = conv.agent_slug.clone();
+                    let workspace = conv.workspace.clone();
+                    let internal = map_to_internal(conv);
+
+                    let outcome = with_concurrent_retry(max_retries, || {
+                        let agent_id = if let Some(id) = agent_cache.get(&agent_slug) {
+                            *id
+                        } else {
+                            let agent = Agent {
+                                id: None,
+                                slug: agent_slug.clone(),
+                                name: agent_slug.clone(),
+                                version: None,
+                                kind: AgentKind::Cli,
+                            };
+                            let id = franken.ensure_agent(&agent)?;
+                            agent_cache.insert(agent_slug.clone(), id);
+                            id
+                        };
+                        let workspace_id = if let Some(ws) = &workspace {
+                            if let Some(id) = workspace_cache.get(ws) {
+                                Some(*id)
+                            } else {
+                                let id = franken.ensure_workspace(ws, None)?;
+                                workspace_cache.insert(ws.clone(), id);
+                                Some(id)
+                            }
+                        } else {
+                            None
+                        };
+                        franken.insert_conversation_tree(agent_id, workspace_id, &internal)
+                    })?;
+                    outcomes.push((idx, outcome));
+                }
+
+                Ok(outcomes)
+            })
+            .collect();
+
+        let mut ordered = Vec::with_capacity(convs.len());
+        for chunk in indexed_chunks {
+            ordered.extend(chunk?);
+        }
+        ordered.sort_by_key(|(idx, _)| *idx);
+
+        for (idx, outcome) in ordered {
+            let conv = &convs[idx];
+            if force_tantivy_reindex {
+                t_index.add_messages(conv, &conv.messages)?;
+            } else if !outcome.inserted_indices.is_empty() {
+                let new_msgs: Vec<_> = conv
+                    .messages
+                    .iter()
+                    .filter(|m| outcome.inserted_indices.contains(&m.idx))
+                    .cloned()
+                    .collect();
+                t_index.add_messages(conv, &new_msgs)?;
+            }
+        }
+
+        Ok(())
+    }
 
     /// Extract provenance (source_id, origin_host) from conversation metadata.
     ///
@@ -2233,6 +2417,22 @@ pub mod persist {
             return Ok(());
         }
 
+        if begin_concurrent_writes_enabled() {
+            let db_path = storage
+                .database_path()
+                .with_context(|| "resolving sqlite path for begin-concurrent write mode")?;
+            tracing::info!(
+                conversations = convs.len(),
+                "using begin-concurrent write path for indexing"
+            );
+            return persist_conversations_batched_begin_concurrent(
+                &db_path,
+                t_index,
+                convs,
+                force_tantivy_reindex,
+            );
+        }
+
         let cache_enabled = IndexingCache::is_enabled();
         let mut cache = IndexingCache::new();
 
@@ -2314,6 +2514,228 @@ pub mod persist {
             "tool" => MessageRole::Tool,
             "system" => MessageRole::System,
             other => MessageRole::Other(other.to_string()),
+        }
+    }
+
+    #[cfg(test)]
+    mod persist_internal_tests {
+        use super::*;
+
+        struct EnvGuard {
+            key: &'static str,
+            previous: Option<String>,
+        }
+
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                if let Some(value) = &self.previous {
+                    // SAFETY: test helper restores process env key it changed.
+                    unsafe {
+                        std::env::set_var(self.key, value);
+                    }
+                } else {
+                    // SAFETY: test helper restores process env key it changed.
+                    unsafe {
+                        std::env::remove_var(self.key);
+                    }
+                }
+            }
+        }
+
+        fn set_env(key: &'static str, value: &str) -> EnvGuard {
+            let previous = dotenvy::var(key).ok();
+            // SAFETY: isolated test mutates a process env var and restores via guard.
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            EnvGuard { key, previous }
+        }
+
+        #[test]
+        fn begin_concurrent_flag_parsing() {
+            let _guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "1");
+            assert!(begin_concurrent_writes_enabled());
+        }
+
+        #[test]
+        fn begin_concurrent_chunk_size_parsing() {
+            let _guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT_CHUNK_SIZE", "7");
+            assert_eq!(begin_concurrent_chunk_size(), 7);
+        }
+
+        #[test]
+        fn begin_concurrent_retry_limit_parsing() {
+            let _guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT_RETRIES", "9");
+            assert_eq!(begin_concurrent_retry_limit(), 9);
+        }
+
+        #[test]
+        fn begin_concurrent_writer_cache_parsing() {
+            let _guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT_WRITER_CACHE_KIB", "2048");
+            assert_eq!(begin_concurrent_writer_cache_kib(), 2048);
+        }
+
+        #[test]
+        fn begin_concurrent_writer_cache_invalid_defaults() {
+            let _guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT_WRITER_CACHE_KIB", "0");
+            assert_eq!(begin_concurrent_writer_cache_kib(), 4096);
+        }
+
+        #[test]
+        fn retryable_franken_errors_are_detected() {
+            let retryable = anyhow::Error::new(FrankenError::BusySnapshot {
+                conflicting_pages: "1,2".to_string(),
+            });
+            assert!(is_retryable_franken_error(&retryable));
+
+            let not_retryable = anyhow::Error::new(FrankenError::ConcurrentUnavailable);
+            assert!(!is_retryable_franken_error(&not_retryable));
+        }
+
+        /// Helper: create a frankensqlite-native database with schema applied.
+        fn create_franken_db(path: &std::path::Path) -> FrankenStorage {
+            let fs = FrankenStorage::open(path).expect("open frankensqlite db");
+            fs.run_migrations().expect("run migrations");
+            fs
+        }
+
+        #[test]
+        fn begin_concurrent_persist_writes_all_conversations() {
+            use crate::connectors::{NormalizedConversation, NormalizedMessage};
+            use crate::search::tantivy::TantivyIndex;
+            use frankensqlite::compat::{ConnectionExt, RowExt};
+
+            let dir = tempfile::TempDir::new().unwrap();
+            let db_path = dir.path().join("test.db");
+            let index_path = dir.path().join("tantivy");
+
+            // Create frankensqlite-native database (BEGIN CONCURRENT requires it)
+            let frank = create_franken_db(&db_path);
+            drop(frank); // close so writers can open independently
+            let mut t_index = TantivyIndex::open_or_create(&index_path).unwrap();
+
+            // Build 10 conversations across 3 agent slugs
+            let convs: Vec<NormalizedConversation> = (0..10)
+                .map(|i| {
+                    let slug = format!("agent-{}", i % 3);
+                    NormalizedConversation {
+                        agent_slug: slug,
+                        external_id: Some(format!("conv-{i}")),
+                        title: Some(format!("Conversation {i}")),
+                        workspace: Some(std::path::PathBuf::from(format!("/ws/{i}"))),
+                        source_path: std::path::PathBuf::from(format!("/log/{i}.jsonl")),
+                        started_at: Some(1000 + i * 100),
+                        ended_at: Some(1000 + i * 100 + 50),
+                        metadata: serde_json::json!({}),
+                        messages: (0..3)
+                            .map(|j| NormalizedMessage {
+                                idx: j,
+                                role: if j % 2 == 0 { "user" } else { "assistant" }.to_string(),
+                                author: Some("tester".into()),
+                                created_at: Some(1000 + i * 100 + j * 10),
+                                content: format!("begin-concurrent-test conv={i} msg={j}"),
+                                extra: serde_json::json!({}),
+                                snippets: vec![],
+                            })
+                            .collect(),
+                    }
+                })
+                .collect();
+
+            // Set chunk size < conversation count to exercise multiple parallel writers
+            let _chunk_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT_CHUNK_SIZE", "3");
+
+            persist_conversations_batched_begin_concurrent(&db_path, &mut t_index, &convs, true)
+                .expect("begin-concurrent persist should succeed");
+
+            // Verify using FrankenStorage reader
+            let reader = FrankenStorage::open(&db_path).unwrap();
+            let count: i64 = reader
+                .raw()
+                .query_row_map("SELECT COUNT(*) FROM conversations", &[], |row| {
+                    row.get_typed(0)
+                })
+                .unwrap();
+            assert_eq!(count, 10, "all 10 conversations should be persisted");
+
+            let msg_count: i64 = reader
+                .raw()
+                .query_row_map("SELECT COUNT(*) FROM messages", &[], |row| row.get_typed(0))
+                .unwrap();
+            assert_eq!(msg_count, 30, "all 30 messages should be persisted");
+
+            let agent_count: i64 = reader
+                .raw()
+                .query_row_map("SELECT COUNT(DISTINCT slug) FROM agents", &[], |row| {
+                    row.get_typed(0)
+                })
+                .unwrap();
+            assert_eq!(agent_count, 3, "3 distinct agent slugs should exist");
+
+            // Commit tantivy to finalize
+            t_index.commit().unwrap();
+        }
+
+        #[test]
+        fn begin_concurrent_single_conversation_works() {
+            use crate::connectors::{NormalizedConversation, NormalizedMessage};
+            use crate::search::tantivy::TantivyIndex;
+            use frankensqlite::compat::{ConnectionExt, RowExt};
+
+            let dir = tempfile::TempDir::new().unwrap();
+            let db_path = dir.path().join("test.db");
+            let index_path = dir.path().join("tantivy");
+
+            let frank = create_franken_db(&db_path);
+            drop(frank);
+            let mut t_index = TantivyIndex::open_or_create(&index_path).unwrap();
+
+            let convs = vec![NormalizedConversation {
+                agent_slug: "solo-agent".into(),
+                external_id: Some("solo-1".into()),
+                title: Some("Solo test".into()),
+                workspace: None,
+                source_path: std::path::PathBuf::from("/log/solo.jsonl"),
+                started_at: Some(5000),
+                ended_at: Some(5050),
+                metadata: serde_json::json!({}),
+                messages: vec![NormalizedMessage {
+                    idx: 0,
+                    role: "user".into(),
+                    author: Some("tester".into()),
+                    created_at: Some(5000),
+                    content: "single-conv-begin-concurrent-test".into(),
+                    extra: serde_json::json!({}),
+                    snippets: vec![],
+                }],
+            }];
+
+            persist_conversations_batched_begin_concurrent(&db_path, &mut t_index, &convs, true)
+                .expect("single conversation begin-concurrent persist should succeed");
+
+            let reader = FrankenStorage::open(&db_path).unwrap();
+            let count: i64 = reader
+                .raw()
+                .query_row_map("SELECT COUNT(*) FROM conversations", &[], |row| {
+                    row.get_typed(0)
+                })
+                .unwrap();
+            assert_eq!(count, 1);
+
+            let msg_count: i64 = reader
+                .raw()
+                .query_row_map("SELECT COUNT(*) FROM messages", &[], |row| row.get_typed(0))
+                .unwrap();
+            assert_eq!(msg_count, 1);
+        }
+
+        #[test]
+        fn begin_concurrent_disabled_falls_through_to_default() {
+            let _guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "0");
+            assert!(!begin_concurrent_writes_enabled());
+
+            let _guard2 = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "false");
+            assert!(!begin_concurrent_writes_enabled());
         }
     }
 }

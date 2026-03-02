@@ -5,10 +5,7 @@
 
 use anyhow::{Context, Result};
 use frankensqlite::Connection;
-use frankensqlite::compat::{
-    BatchExt, ConnectionExt, OptionalExtension, RowExt,
-    TransactionExt,
-};
+use frankensqlite::compat::{BatchExt, ConnectionExt, OptionalExtension, RowExt, TransactionExt};
 use frankensqlite::params;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -213,10 +210,14 @@ impl BookmarkStore {
         let sql = "SELECT id, title, source_path, line_number, agent, workspace, note, tags, created_at, updated_at, snippet
                    FROM bookmarks ORDER BY created_at DESC";
 
-        let all_bookmarks: Vec<Bookmark> = self.conn.query_map_collect(sql, &[], row_to_bookmark)?;
+        let all_bookmarks: Vec<Bookmark> =
+            self.conn.query_map_collect(sql, &[], row_to_bookmark)?;
 
         if let Some(tag) = tag_filter {
-            Ok(all_bookmarks.into_iter().filter(|b| b.has_tag(tag)).collect())
+            Ok(all_bookmarks
+                .into_iter()
+                .filter(|b| b.has_tag(tag))
+                .collect())
         } else {
             Ok(all_bookmarks)
         }
@@ -259,9 +260,11 @@ impl BookmarkStore {
 
     /// Count total bookmarks
     pub fn count(&self) -> Result<usize> {
-        let count: i64 = self
-            .conn
-            .query_row_map("SELECT COUNT(*) FROM bookmarks", &[], |row: &frankensqlite::Row| row.get_typed(0))?;
+        let count: i64 = self.conn.query_row_map(
+            "SELECT COUNT(*) FROM bookmarks",
+            &[],
+            |row: &frankensqlite::Row| row.get_typed(0),
+        )?;
         usize::try_from(count).context("bookmark count is out of range")
     }
 
@@ -300,7 +303,8 @@ impl BookmarkStore {
                 "SELECT EXISTS(SELECT 1 FROM bookmarks WHERE source_path = ?1 AND line_number IS ?2)",
                 &check_values,
             )?;
-            let exists: i64 = exists_row.first()
+            let exists: i64 = exists_row
+                .first()
                 .and_then(|row| row.get_typed(0).ok())
                 .unwrap_or(0);
 

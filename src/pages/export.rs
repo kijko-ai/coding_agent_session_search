@@ -205,7 +205,7 @@ impl ExportEngine {
         })?;
 
         // Execute Main Query - collect all conversation rows
-        let conv_rows: Vec<(
+        type ConversationExportRow = (
             i64,
             String,
             Option<String>,
@@ -215,19 +215,21 @@ impl ExportEngine {
             Option<i64>,
             i64,
             Option<String>,
-        )> = src.query_map_collect(&query, &params, |row: &Row| {
-            Ok((
-                row.get_typed::<i64>(0)?,
-                row.get_typed::<String>(1)?,
-                row.get_typed::<Option<String>>(2)?,
-                row.get_typed::<Option<String>>(3)?,
-                row.get_typed::<String>(4)?,
-                row.get_typed::<Option<i64>>(5)?,
-                row.get_typed::<Option<i64>>(6)?,
-                row.get_typed::<i64>(7)?,
-                row.get_typed::<Option<String>>(8)?,
-            ))
-        })?;
+        );
+        let conv_rows: Vec<ConversationExportRow> =
+            src.query_map_collect(&query, &params, |row: &Row| {
+                Ok((
+                    row.get_typed::<i64>(0)?,
+                    row.get_typed::<String>(1)?,
+                    row.get_typed::<Option<String>>(2)?,
+                    row.get_typed::<Option<String>>(3)?,
+                    row.get_typed::<String>(4)?,
+                    row.get_typed::<Option<i64>>(5)?,
+                    row.get_typed::<Option<i64>>(6)?,
+                    row.get_typed::<i64>(7)?,
+                    row.get_typed::<Option<String>>(8)?,
+                ))
+            })?;
 
         let mut processed = 0;
         let mut msg_processed = 0;
