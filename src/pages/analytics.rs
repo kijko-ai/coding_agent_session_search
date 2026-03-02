@@ -26,7 +26,8 @@
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Datelike, NaiveDate, Utc};
-use rusqlite::Connection;
+use frankensqlite::compat::{ConnectionExt, RowExt};
+use frankensqlite::{Connection, Row};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -250,35 +251,38 @@ impl<'a> AnalyticsGenerator<'a> {
         // Total conversations
         let total_conversations: i64 = self
             .db
-            .query_row("SELECT COUNT(*) FROM conversations", [], |row| row.get(0))
+            .query_row_map("SELECT COUNT(*) FROM conversations", &[], |row: &Row| {
+                row.get_typed(0)
+            })
             .context("Failed to count conversations")?;
 
         // Total messages
         let total_messages: i64 = self
             .db
-            .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
+            .query_row_map("SELECT COUNT(*) FROM messages", &[], |row: &Row| {
+                row.get_typed(0)
+            })
             .context("Failed to count messages")?;
 
         // Total characters
         let total_characters: i64 = self
             .db
-            .query_row(
-                "SELECT COALESCE(SUM(LENGTH(content)), 0) FROM messages",
-                [],
-                |row| row.get(0),
+            .query_row_map(
+                "SELECT SUM(LENGTH(content)) FROM messages",
+                &[],
+                |row: &Row| row.get_typed::<Option<i64>>(0),
             )
-            .context("Failed to sum content lengths")?;
+            .context("Failed to sum content lengths")?
+            .unwrap_or(0);
 
         // Per-agent stats
         let mut agents: HashMap<String, AgentStats> = HashMap::new();
-        let mut stmt = self
-            .db
-            .prepare("SELECT agent, COUNT(*) as conv_count FROM conversations GROUP BY agent")?;
-        let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-        })?;
-        for row in rows {
-            let (agent, conv_count) = row?;
+        let agent_conv_rows: Vec<(String, i64)> = self.db.query_map_collect(
+            "SELECT agent, COUNT(*) as conv_count FROM conversations GROUP BY agent",
+            &[],
+            |row: &Row| Ok((row.get_typed::<String>(0)?, row.get_typed::<i64>(1)?)),
+        )?;
+        for (agent, conv_count) in agent_conv_rows {
             agents.insert(
                 agent.clone(),
                 AgentStats {
@@ -289,16 +293,14 @@ impl<'a> AnalyticsGenerator<'a> {
         }
 
         // Fill in message counts per agent
-        let mut msg_stmt = self.db.prepare(
+        let msg_rows: Vec<(String, i64)> = self.db.query_map_collect(
             "SELECT c.agent, COUNT(m.id) FROM messages m
              JOIN conversations c ON m.conversation_id = c.id
              GROUP BY c.agent",
+            &[],
+            |row: &Row| Ok((row.get_typed::<String>(0)?, row.get_typed::<i64>(1)?)),
         )?;
-        let msg_rows = msg_stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-        })?;
-        for row in msg_rows {
-            let (agent, msg_count) = row?;
+        for (agent, msg_count) in msg_rows {
             if let Some(stats) = agents.get_mut(&agent) {
                 stats.messages = msg_count as usize;
             }
@@ -306,24 +308,22 @@ impl<'a> AnalyticsGenerator<'a> {
 
         // Per-role counts
         let mut roles: HashMap<String, usize> = HashMap::new();
-        let mut role_stmt = self
-            .db
-            .prepare("SELECT role, COUNT(*) FROM messages GROUP BY role")?;
-        let role_rows = role_stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-        })?;
-        for row in role_rows {
-            let (role, count) = row?;
+        let role_rows: Vec<(String, i64)> = self.db.query_map_collect(
+            "SELECT role, COUNT(*) FROM messages GROUP BY role",
+            &[],
+            |row: &Row| Ok((row.get_typed::<String>(0)?, row.get_typed::<i64>(1)?)),
+        )?;
+        for (role, count) in role_rows {
             roles.insert(role, count as usize);
         }
 
         // Time range
         let time_range: (Option<i64>, Option<i64>) = self
             .db
-            .query_row(
+            .query_row_map(
                 "SELECT MIN(started_at), MAX(started_at) FROM conversations",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                &[],
+                |row: &Row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
             )
             .context("Failed to get time range")?;
 
@@ -355,18 +355,21 @@ impl<'a> AnalyticsGenerator<'a> {
         let mut daily_map: HashMap<String, DailyEntry> = HashMap::new();
         let mut daily_conv_ids: HashMap<String, HashSet<i64>> = HashMap::new();
 
-        let mut stmt = self.db.prepare(
+        let timeline_rows: Vec<(Option<String>, i64)> = self.db.query_map_collect(
             "SELECT DATE(m.created_at/1000, 'unixepoch') as date, m.conversation_id
              FROM messages m
              WHERE m.created_at IS NOT NULL
              ORDER BY date",
+            &[],
+            |row: &Row| {
+                Ok((
+                    row.get_typed::<Option<String>>(0)?,
+                    row.get_typed::<i64>(1)?,
+                ))
+            },
         )?;
-        let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, Option<String>>(0)?, row.get::<_, i64>(1)?))
-        })?;
 
-        for row in rows {
-            let (date_opt, conv_id) = row?;
+        for (date_opt, conv_id) in timeline_rows {
             if let Some(date) = date_opt {
                 let entry = daily_map.entry(date.clone()).or_insert(DailyEntry {
                     date: date.clone(),
@@ -400,23 +403,23 @@ impl<'a> AnalyticsGenerator<'a> {
         let mut agent_daily_conv_ids: HashMap<String, HashMap<String, HashSet<i64>>> =
             HashMap::new();
 
-        let mut agent_stmt = self.db.prepare(
+        let agent_timeline_rows: Vec<(Option<String>, String, i64)> = self.db.query_map_collect(
             "SELECT DATE(m.created_at/1000, 'unixepoch') as date, c.agent, m.conversation_id
              FROM messages m
              JOIN conversations c ON m.conversation_id = c.id
              WHERE m.created_at IS NOT NULL
              ORDER BY date",
+            &[],
+            |row: &Row| {
+                Ok((
+                    row.get_typed::<Option<String>>(0)?,
+                    row.get_typed::<String>(1)?,
+                    row.get_typed::<i64>(2)?,
+                ))
+            },
         )?;
-        let agent_rows = agent_stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, Option<String>>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)?,
-            ))
-        })?;
 
-        for row in agent_rows {
-            let (date_opt, agent, conv_id) = row?;
+        for (date_opt, agent, conv_id) in agent_timeline_rows {
             if let Some(date) = date_opt {
                 let agent_map = agent_daily_map.entry(agent.clone()).or_default();
                 let entry = agent_map.entry(date.clone()).or_insert(DailyEntry {
@@ -479,86 +482,73 @@ impl<'a> AnalyticsGenerator<'a> {
         let mut workspaces: Vec<WorkspaceEntry> = Vec::new();
 
         // Query 1: base workspace rows with conversation/time aggregates.
-        let mut workspace_rows: Vec<(String, i64, Option<i64>, Option<i64>)> = Vec::new();
-        let mut workspace_stmt = self.db.prepare(
-            "SELECT workspace, COUNT(*) as conv_count,
+        let workspace_rows: Vec<(String, i64, Option<i64>, Option<i64>)> =
+            self.db.query_map_collect(
+                "SELECT workspace, COUNT(*) as conv_count,
                     MIN(started_at), MAX(started_at)
              FROM conversations
              WHERE workspace IS NOT NULL
              GROUP BY workspace
              ORDER BY conv_count DESC",
-        )?;
-        let rows = workspace_stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, Option<i64>>(2)?,
-                row.get::<_, Option<i64>>(3)?,
-            ))
-        })?;
-        for row in rows {
-            workspace_rows.push(row?);
-        }
+                &[],
+                |row: &Row| {
+                    Ok((
+                        row.get_typed::<String>(0)?,
+                        row.get_typed::<i64>(1)?,
+                        row.get_typed::<Option<i64>>(2)?,
+                        row.get_typed::<Option<i64>>(3)?,
+                    ))
+                },
+            )?;
 
         // Query 2: message counts for every workspace.
         let mut messages_by_workspace: HashMap<String, i64> = HashMap::new();
-        let mut msg_stmt = self.db.prepare(
+        let ws_msg_rows: Vec<(String, i64)> = self.db.query_map_collect(
             "SELECT c.workspace, COUNT(m.id)
              FROM conversations c
              LEFT JOIN messages m ON m.conversation_id = c.id
              WHERE c.workspace IS NOT NULL
              GROUP BY c.workspace",
+            &[],
+            |row: &Row| Ok((row.get_typed::<String>(0)?, row.get_typed::<i64>(1)?)),
         )?;
-        let msg_rows = msg_stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-        })?;
-        for row in msg_rows {
-            let (workspace, msg_count) = row?;
+        for (workspace, msg_count) in ws_msg_rows {
             messages_by_workspace.insert(workspace, msg_count);
         }
 
         // Query 3: distinct agents for every workspace.
         let mut agents_by_workspace: HashMap<String, Vec<String>> = HashMap::new();
-        let mut agent_stmt = self.db.prepare(
+        let ws_agent_rows: Vec<(String, String)> = self.db.query_map_collect(
             "SELECT workspace, agent
              FROM conversations
              WHERE workspace IS NOT NULL
              GROUP BY workspace, agent
              ORDER BY workspace, agent",
+            &[],
+            |row: &Row| Ok((row.get_typed::<String>(0)?, row.get_typed::<String>(1)?)),
         )?;
-        let agent_rows = agent_stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?;
-        for row in agent_rows {
-            let (workspace, agent) = row?;
+        for (workspace, agent) in ws_agent_rows {
             agents_by_workspace
                 .entry(workspace)
                 .or_default()
                 .push(agent);
         }
 
-        // Query 4: top-5 recent titles per workspace (windowed, set-based).
+        // Query 4: recent titles per workspace (sorted by started_at DESC, top 5 per workspace in Rust).
         let mut recent_titles_by_workspace: HashMap<String, Vec<String>> = HashMap::new();
-        let mut title_stmt = self.db.prepare(
+        let ws_title_rows: Vec<(String, String)> = self.db.query_map_collect(
             "SELECT workspace, title
-             FROM (
-                 SELECT workspace, title,
-                        ROW_NUMBER() OVER (PARTITION BY workspace ORDER BY started_at DESC) as rn
-                 FROM conversations
-                 WHERE workspace IS NOT NULL AND title IS NOT NULL
-             )
-             WHERE rn <= 5
-             ORDER BY workspace, rn",
+             FROM conversations
+             WHERE workspace IS NOT NULL AND title IS NOT NULL
+             ORDER BY workspace, started_at DESC",
+            &[],
+            |row: &Row| Ok((row.get_typed::<String>(0)?, row.get_typed::<String>(1)?)),
         )?;
-        let title_rows = title_stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?;
-        for row in title_rows {
-            let (workspace, title) = row?;
-            recent_titles_by_workspace
-                .entry(workspace)
-                .or_default()
-                .push(title);
+        for (workspace, title) in ws_title_rows {
+            let titles = recent_titles_by_workspace.entry(workspace).or_default();
+            if titles.len() < 5 {
+                titles.push(title);
+            }
         }
 
         for (workspace, conv_count, min_ts, max_ts) in workspace_rows {
@@ -610,56 +600,49 @@ impl<'a> AnalyticsGenerator<'a> {
         let mut agents: Vec<AgentEntry> = Vec::new();
 
         // Query 1: base agent rows with conversation/time aggregates.
-        let mut agent_rows: Vec<(String, i64, Option<i64>, Option<i64>)> = Vec::new();
-        let mut agent_stmt = self.db.prepare(
+        let agent_rows: Vec<(String, i64, Option<i64>, Option<i64>)> = self.db.query_map_collect(
             "SELECT agent, COUNT(*) as conv_count,
                     MIN(started_at), MAX(started_at)
              FROM conversations
              GROUP BY agent
              ORDER BY conv_count DESC",
+            &[],
+            |row: &Row| {
+                Ok((
+                    row.get_typed::<String>(0)?,
+                    row.get_typed::<i64>(1)?,
+                    row.get_typed::<Option<i64>>(2)?,
+                    row.get_typed::<Option<i64>>(3)?,
+                ))
+            },
         )?;
-        let rows = agent_stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, Option<i64>>(2)?,
-                row.get::<_, Option<i64>>(3)?,
-            ))
-        })?;
-        for row in rows {
-            agent_rows.push(row?);
-        }
 
         // Query 2: message counts for every agent.
         let mut messages_by_agent: HashMap<String, i64> = HashMap::new();
-        let mut msg_stmt = self.db.prepare(
+        let agent_msg_rows: Vec<(String, i64)> = self.db.query_map_collect(
             "SELECT c.agent, COUNT(m.id)
              FROM conversations c
              LEFT JOIN messages m ON m.conversation_id = c.id
              GROUP BY c.agent",
+            &[],
+            |row: &Row| Ok((row.get_typed::<String>(0)?, row.get_typed::<i64>(1)?)),
         )?;
-        let msg_rows = msg_stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-        })?;
-        for row in msg_rows {
-            let (agent, msg_count) = row?;
+        for (agent, msg_count) in agent_msg_rows {
             messages_by_agent.insert(agent, msg_count);
         }
 
         // Query 3: distinct workspaces for every agent.
         let mut workspaces_by_agent: HashMap<String, Vec<String>> = HashMap::new();
-        let mut ws_stmt = self.db.prepare(
+        let agent_ws_rows: Vec<(String, String)> = self.db.query_map_collect(
             "SELECT agent, workspace
              FROM conversations
              WHERE workspace IS NOT NULL
              GROUP BY agent, workspace
              ORDER BY agent, workspace",
+            &[],
+            |row: &Row| Ok((row.get_typed::<String>(0)?, row.get_typed::<String>(1)?)),
         )?;
-        let ws_rows = ws_stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?;
-        for row in ws_rows {
-            let (agent, workspace) = row?;
+        for (agent, workspace) in agent_ws_rows {
             workspaces_by_agent
                 .entry(agent)
                 .or_default()
@@ -710,15 +693,15 @@ impl<'a> AnalyticsGenerator<'a> {
         let stop_words: HashSet<&str> = STOP_WORDS.iter().copied().collect();
 
         // Get all titles
-        let mut stmt = self
-            .db
-            .prepare("SELECT title FROM conversations WHERE title IS NOT NULL")?;
-        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let titles: Vec<String> = self.db.query_map_collect(
+            "SELECT title FROM conversations WHERE title IS NOT NULL",
+            &[],
+            |row: &Row| row.get_typed::<String>(0),
+        )?;
 
         let mut term_counts: HashMap<String, usize> = HashMap::new();
 
-        for row in rows {
-            let title = row?;
+        for title in titles {
             for word in title.split_whitespace() {
                 // Clean the word: remove punctuation, lowercase
                 let word: String = word
@@ -802,9 +785,10 @@ mod tests {
     use tempfile::TempDir;
 
     fn create_test_db() -> (TempDir, Connection) {
+        use frankensqlite::compat::BatchExt;
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("test.db");
-        let conn = Connection::open(&db_path).unwrap();
+        let conn = Connection::open(db_path.to_string_lossy().as_ref()).unwrap();
 
         // Create schema
         conn.execute_batch(
@@ -839,17 +823,14 @@ mod tests {
         conn.execute(
             "INSERT INTO conversations (id, agent, workspace, title, source_path, started_at, message_count)
              VALUES (1, 'claude-code', '/home/user/project-a', 'Debug authentication flow', '/path/a.jsonl', 1700000000000, 5)",
-            [],
         ).unwrap();
         conn.execute(
             "INSERT INTO conversations (id, agent, workspace, title, source_path, started_at, message_count)
              VALUES (2, 'claude-code', '/home/user/project-a', 'Fix database connection', '/path/b.jsonl', 1700100000000, 3)",
-            [],
         ).unwrap();
         conn.execute(
             "INSERT INTO conversations (id, agent, workspace, title, source_path, started_at, message_count)
              VALUES (3, 'codex', '/home/user/project-b', 'Add user authentication', '/path/c.jsonl', 1700200000000, 4)",
-            [],
         ).unwrap();
 
         // Insert messages
@@ -864,14 +845,15 @@ mod tests {
                 let role = if idx % 2 == 0 { "user" } else { "assistant" };
                 let created_at =
                     1700000000000i64 + (conv_id as i64 * 100000000) + (idx as i64 * 1000);
-                conn.execute(
+                let content = format!("Message {} for conv {}", idx, conv_id);
+                conn.execute_params(
                     "INSERT INTO messages (conversation_id, idx, role, content, created_at)
-                     VALUES (?, ?, ?, ?, ?)",
-                    rusqlite::params![
-                        conv_id,
-                        idx,
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    frankensqlite::params![
+                        conv_id as i64,
+                        idx as i64,
                         role,
-                        format!("Message {} for conv {}", idx, conv_id),
+                        content.as_str(),
                         created_at
                     ],
                 )
@@ -1008,22 +990,25 @@ mod tests {
         for i in 0..40 {
             let workspace = format!("/home/user/ws-{}", i % 10);
             let started_at = 1_700_000_000_000i64 + i as i64 * 1_000;
-            conn.execute(
+            let title = format!("Claude conversation {}", i);
+            let source = format!("/path/{}.jsonl", conv_id);
+            conn.execute_params(
                 "INSERT INTO conversations (id, agent, workspace, title, source_path, started_at, message_count)
-                 VALUES (?, 'claude-code', ?, ?, ?, ?, 1)",
-                rusqlite::params![
+                 VALUES (?1, 'claude-code', ?2, ?3, ?4, ?5, 1)",
+                frankensqlite::params![
                     conv_id,
-                    workspace,
-                    format!("Claude conversation {}", i),
-                    format!("/path/{}.jsonl", conv_id),
+                    workspace.as_str(),
+                    title.as_str(),
+                    source.as_str(),
                     started_at
                 ],
             )
             .unwrap();
-            conn.execute(
+            let content = format!("message {}", i);
+            conn.execute_params(
                 "INSERT INTO messages (conversation_id, idx, role, content, created_at)
-                 VALUES (?, 0, 'assistant', ?, ?)",
-                rusqlite::params![conv_id, format!("message {}", i), started_at],
+                 VALUES (?1, 0, 'assistant', ?2, ?3)",
+                frankensqlite::params![conv_id, content.as_str(), started_at],
             )
             .unwrap();
             conv_id += 1;
@@ -1032,21 +1017,24 @@ mod tests {
         // Secondary agent with lower cardinality.
         for i in 0..5 {
             let started_at = 1_700_100_000_000i64 + i as i64 * 1_000;
-            conn.execute(
+            let title = format!("Codex conversation {}", i);
+            let source = format!("/path/{}.jsonl", conv_id);
+            conn.execute_params(
                 "INSERT INTO conversations (id, agent, workspace, title, source_path, started_at, message_count)
-                 VALUES (?, 'codex', '/home/user/codex-ws', ?, ?, ?, 1)",
-                rusqlite::params![
+                 VALUES (?1, 'codex', '/home/user/codex-ws', ?2, ?3, ?4, 1)",
+                frankensqlite::params![
                     conv_id,
-                    format!("Codex conversation {}", i),
-                    format!("/path/{}.jsonl", conv_id),
+                    title.as_str(),
+                    source.as_str(),
                     started_at
                 ],
             )
             .unwrap();
-            conn.execute(
+            let content = format!("codex {}", i);
+            conn.execute_params(
                 "INSERT INTO messages (conversation_id, idx, role, content, created_at)
-                 VALUES (?, 0, 'assistant', ?, ?)",
-                rusqlite::params![conv_id, format!("codex {}", i), started_at],
+                 VALUES (?1, 0, 'assistant', ?2, ?3)",
+                frankensqlite::params![conv_id, content.as_str(), started_at],
             )
             .unwrap();
             conv_id += 1;

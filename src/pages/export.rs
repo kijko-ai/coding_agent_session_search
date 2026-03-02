@@ -2,12 +2,14 @@ use crate::ui::time_parser::parse_time_input;
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use clap::ValueEnum;
-use rusqlite::{Connection, params};
+use frankensqlite::compat::{
+    ConnectionExt, OpenFlags, ParamValue, RowExt, TransactionExt, open_with_flags,
+};
+use frankensqlite::{Connection, Row};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
 
 #[derive(Debug, Clone)]
 pub struct ExportFilter {
@@ -66,24 +68,19 @@ impl ExportEngine {
         }
 
         // 1. Open source DB
-        let src = Connection::open_with_flags(
-            &self.source_db_path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        let src = open_with_flags(
+            &self.source_db_path.to_string_lossy(),
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
         )
         .context("Failed to open source database")?;
-        src.busy_timeout(Duration::from_secs(5))?;
 
         // 2. Prepare output DB
         if self.output_path.exists() {
             std::fs::remove_file(&self.output_path)
                 .context("Failed to remove existing output file")?;
         }
-        let mut dest =
-            Connection::open(&self.output_path).context("Failed to create output database")?;
-
-        // Enable FTS5
-        // Note: rusqlite bundled feature should handle this, but we need to ensure extension loading if not.
-        // For now, assume compiled with fts5.
+        let dest = Connection::open(self.output_path.to_string_lossy().as_ref())
+            .context("Failed to create output database")?;
 
         let tx = dest.transaction()?;
 
@@ -100,7 +97,6 @@ impl ExportEngine {
                 message_count INTEGER,
                 metadata_json TEXT
             )",
-            [],
         )
         .context("Failed to create conversations table")?;
 
@@ -115,7 +111,6 @@ impl ExportEngine {
                 attachment_refs TEXT,
                 FOREIGN KEY (conversation_id) REFERENCES conversations(id)
             )",
-            [],
         )
         .context("Failed to create messages table")?;
 
@@ -124,7 +119,6 @@ impl ExportEngine {
                 key TEXT PRIMARY KEY,
                 value TEXT
             )",
-            [],
         )
         .context("Failed to create export_meta table")?;
 
@@ -135,7 +129,6 @@ impl ExportEngine {
                 content_rowid='id',
                 tokenize='porter unicode61 remove_diacritics 2'
             )",
-            [],
         )
         .context("Failed to create messages_fts table")?;
 
@@ -146,21 +139,20 @@ impl ExportEngine {
                 content_rowid='id',
                 tokenize="unicode61 tokenchars '-_./:@#$%\\'"
             )"#,
-            [],
         )
         .context("Failed to create messages_code_fts table")?;
 
         // 4. Query Source
         let mut query = String::from(
-            "SELECT c.id, a.slug as agent, w.path as workspace, c.title, c.source_path, c.started_at, c.ended_at, 
-             (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count, 
-             c.metadata_json 
+            "SELECT c.id, a.slug as agent, w.path as workspace, c.title, c.source_path, c.started_at, c.ended_at,
+             (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count,
+             c.metadata_json
              FROM conversations c
              JOIN agents a ON c.agent_id = a.id
              LEFT JOIN workspaces w ON c.workspace_id = w.id
              WHERE 1=1"
         );
-        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        let mut params: Vec<ParamValue> = Vec::new();
 
         if let Some(agents) = &self.filter.agents {
             if agents.is_empty() {
@@ -172,7 +164,7 @@ impl ExportEngine {
                         query.push_str(", ");
                     }
                     query.push('?');
-                    params.push(Box::new(agent.clone()));
+                    params.push(ParamValue::from(agent.clone()));
                 }
                 query.push(')');
             }
@@ -190,7 +182,7 @@ impl ExportEngine {
                         query.push_str(", ");
                     }
                     query.push('?');
-                    params.push(Box::new(ws.to_string_lossy().to_string()));
+                    params.push(ParamValue::from(ws.to_string_lossy().to_string()));
                 }
                 query.push(')');
             }
@@ -198,97 +190,120 @@ impl ExportEngine {
 
         if let Some(since) = self.filter.since {
             query.push_str(" AND c.started_at >= ?");
-            params.push(Box::new(since.timestamp_millis()));
+            params.push(ParamValue::from(since.timestamp_millis()));
         }
 
         if let Some(until) = self.filter.until {
             query.push_str(" AND c.started_at <= ?");
-            params.push(Box::new(until.timestamp_millis()));
+            params.push(ParamValue::from(until.timestamp_millis()));
         }
 
         // Count total for progress
         let count_query = format!("SELECT COUNT(*) FROM ({})", query);
-        let total_convs: usize = src.query_row(
-            &count_query,
-            rusqlite::params_from_iter(params.iter()),
-            |row| row.get::<_, i64>(0).map(|v| v as usize),
-        )?;
+        let total_convs: usize = src.query_row_map(&count_query, &params, |row: &Row| {
+            row.get_typed::<i64>(0).map(|v| v as usize)
+        })?;
 
-        // Execute Main Query
-        let mut stmt = src.prepare(&query)?;
-        let mut rows = stmt.query(rusqlite::params_from_iter(params.iter()))?;
+        // Execute Main Query - collect all conversation rows
+        let conv_rows: Vec<(
+            i64,
+            String,
+            Option<String>,
+            Option<String>,
+            String,
+            Option<i64>,
+            Option<i64>,
+            i64,
+            Option<String>,
+        )> = src.query_map_collect(&query, &params, |row: &Row| {
+            Ok((
+                row.get_typed::<i64>(0)?,
+                row.get_typed::<String>(1)?,
+                row.get_typed::<Option<String>>(2)?,
+                row.get_typed::<Option<String>>(3)?,
+                row.get_typed::<String>(4)?,
+                row.get_typed::<Option<i64>>(5)?,
+                row.get_typed::<Option<i64>>(6)?,
+                row.get_typed::<i64>(7)?,
+                row.get_typed::<Option<String>>(8)?,
+            ))
+        })?;
 
         let mut processed = 0;
         let mut msg_processed = 0;
 
-        let mut msg_stmt = src.prepare(
-            "SELECT role, content, created_at, idx 
-             FROM messages 
-             WHERE conversation_id = ? 
-             ORDER BY idx ASC",
-        )?;
-
-        let mut insert_conv = tx.prepare(
-            "INSERT INTO conversations (id, agent, workspace, title, source_path, started_at, ended_at, message_count, metadata_json)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
-        )?;
-
-        let mut insert_msg = tx.prepare(
-            "INSERT INTO messages (conversation_id, idx, role, content, created_at)
-             VALUES (?, ?, ?, ?, ?)",
-        )?;
-
-        let mut insert_fts =
-            tx.prepare("INSERT INTO messages_fts (rowid, content) VALUES (?, ?)")?;
-
-        let mut insert_code_fts =
-            tx.prepare("INSERT INTO messages_code_fts (rowid, content) VALUES (?, ?)")?;
-
-        while let Some(row) = rows.next()? {
+        for (
+            id,
+            agent,
+            workspace,
+            title,
+            source_path,
+            started_at,
+            ended_at,
+            message_count,
+            metadata_json,
+        ) in &conv_rows
+        {
             if let Some(r) = &running
                 && !r.load(Ordering::Relaxed)
             {
                 return Err(anyhow::anyhow!("Export cancelled"));
             }
 
-            let id: i64 = row.get(0)?;
-            let agent: String = row.get(1)?;
-            let workspace: Option<String> = row.get(2)?;
-            let title: Option<String> = row.get(3)?;
-            let source_path: String = row.get(4)?;
-            let started_at: Option<i64> = row.get(5)?;
-            let ended_at: Option<i64> = row.get(6)?;
-            let message_count: i64 = row.get(7)?;
-            let metadata_json: Option<String> = row.get(8)?;
-
             // Transform Path
-            let transformed_path = self.transform_path(&source_path, &workspace);
+            let transformed_path = self.transform_path(source_path, workspace);
 
-            insert_conv.execute(params![
-                id,
-                agent,
-                workspace,
-                title,
-                transformed_path,
-                started_at,
-                ended_at,
-                message_count,
-                metadata_json
-            ])?;
+            tx.execute_params(
+                "INSERT INTO conversations (id, agent, workspace, title, source_path, started_at, ended_at, message_count, metadata_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                frankensqlite::params![
+                    *id,
+                    agent.as_str(),
+                    workspace.as_deref(),
+                    title.as_deref(),
+                    transformed_path.as_str(),
+                    *started_at,
+                    *ended_at,
+                    *message_count,
+                    metadata_json.as_deref()
+                ],
+            )?;
 
-            // Fetch messages
-            let mut msg_rows = msg_stmt.query(params![id])?;
-            while let Some(msg_row) = msg_rows.next()? {
-                let role: String = msg_row.get(0)?;
-                let content: String = msg_row.get(1)?;
-                let created_at: Option<i64> = msg_row.get(2)?;
-                let idx: i64 = msg_row.get(3)?;
+            // Fetch messages for this conversation
+            let msg_rows: Vec<(String, String, Option<i64>, i64)> = src.query_map_collect(
+                "SELECT role, content, created_at, idx
+                 FROM messages
+                 WHERE conversation_id = ?1
+                 ORDER BY idx ASC",
+                frankensqlite::params![*id],
+                |row: &Row| {
+                    Ok((
+                        row.get_typed::<String>(0)?,
+                        row.get_typed::<String>(1)?,
+                        row.get_typed::<Option<i64>>(2)?,
+                        row.get_typed::<i64>(3)?,
+                    ))
+                },
+            )?;
 
-                let msg_id = insert_msg.insert(params![id, idx, role, content, created_at])?;
+            for (role, content, created_at, idx) in &msg_rows {
+                tx.execute_params(
+                    "INSERT INTO messages (conversation_id, idx, role, content, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    frankensqlite::params![*id, *idx, role.as_str(), content.as_str(), *created_at],
+                )?;
+
+                let msg_id: i64 = tx.query_row("SELECT last_insert_rowid()")?.get_typed(0)?;
 
                 // Populate FTS
-                insert_fts.execute(params![msg_id, content])?;
-                insert_code_fts.execute(params![msg_id, content])?;
+                tx.execute_params(
+                    "INSERT INTO messages_fts (rowid, content) VALUES (?1, ?2)",
+                    frankensqlite::params![msg_id, content.as_str()],
+                )?;
+                tx.execute_params(
+                    "INSERT INTO messages_code_fts (rowid, content) VALUES (?1, ?2)",
+                    frankensqlite::params![msg_id, content.as_str()],
+                )?;
 
                 msg_processed += 1;
             }
@@ -298,21 +313,12 @@ impl ExportEngine {
         }
 
         // Metadata
-        tx.execute(
-            "INSERT INTO export_meta (key, value) VALUES ('schema_version', '1')",
-            [],
+        tx.execute("INSERT INTO export_meta (key, value) VALUES ('schema_version', '1')")?;
+        let exported_at = Utc::now().to_rfc3339();
+        tx.execute_params(
+            "INSERT INTO export_meta (key, value) VALUES ('exported_at', ?1)",
+            frankensqlite::params![exported_at.as_str()],
         )?;
-        tx.execute(
-            "INSERT INTO export_meta (key, value) VALUES ('exported_at', ?)",
-            params![Utc::now().to_rfc3339()],
-        )?;
-
-        drop(insert_conv);
-        drop(insert_msg);
-        drop(insert_fts);
-        drop(insert_code_fts);
-        // drop(msg_stmt); // Removed: Let Rust handle drop order
-        // drop(stmt);     // Removed: Let Rust handle drop order
 
         tx.commit()?;
 
