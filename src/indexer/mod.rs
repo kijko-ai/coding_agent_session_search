@@ -2745,7 +2745,6 @@ mod tests {
     use super::*;
     use crate::connectors::{NormalizedConversation, NormalizedMessage};
     use crate::sources::provenance::SourceKind;
-    use rusqlite::Connection;
     use serial_test::serial;
     use tempfile::TempDir;
 
@@ -2829,19 +2828,17 @@ mod tests {
         let db_path = tmp.path().join("future-schema.db");
 
         {
-            let conn = Connection::open(&db_path).unwrap();
-            conn.execute_batch(
-                "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', ?)",
-                [format!(
-                    "{}",
-                    crate::storage::sqlite::CURRENT_SCHEMA_VERSION + 1
-                )],
-            )
-            .unwrap();
+            let storage = SqliteStorage::open(&db_path).unwrap();
+            storage
+                .raw()
+                .execute(
+                    "INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', ?)",
+                    [format!(
+                        "{}",
+                        crate::storage::sqlite::CURRENT_SCHEMA_VERSION + 1
+                    )],
+                )
+                .unwrap();
         }
 
         let (storage, rebuilt) = open_storage_for_index(&db_path).unwrap();
@@ -2874,7 +2871,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("db.sqlite");
         let mut storage = SqliteStorage::open(&db_path).unwrap();
-        ensure_fts_schema(storage.raw());
+        ensure_fts_schema(&storage);
 
         let agent = crate::model::types::Agent {
             id: None,
@@ -2931,7 +2928,7 @@ mod tests {
             .execute(
                 "INSERT INTO daily_stats(day_id, agent_slug, source_id, session_count, message_count, total_chars, last_updated)
                  VALUES(?1, ?2, ?3, 1, 1, 10, ?4)",
-                rusqlite::params![1_i64, "tester", "local", 123_i64],
+                (1_i64, "tester", "local", 123_i64),
             )
             .unwrap();
         storage
@@ -2939,7 +2936,7 @@ mod tests {
             .execute(
                 "INSERT INTO usage_daily(day_id, agent_slug, workspace_id, source_id, message_count, last_updated)
                  VALUES(?1, ?2, ?3, ?4, 1, ?5)",
-                rusqlite::params![1_i64, "tester", 0_i64, "local", 123_i64],
+                (1_i64, "tester", 0_i64, "local", 123_i64),
             )
             .unwrap();
 
@@ -2974,7 +2971,7 @@ mod tests {
 
         let db_path = data_dir.join("db.sqlite");
         let mut storage = SqliteStorage::open(&db_path).unwrap();
-        ensure_fts_schema(storage.raw());
+        ensure_fts_schema(&storage);
         let mut index = TantivyIndex::open_or_create(&index_dir(&data_dir).unwrap()).unwrap();
 
         let conv1 = norm_conv(Some("ext"), vec![norm_msg(0, 100), norm_msg(1, 200)]);
@@ -3330,12 +3327,13 @@ mod tests {
         }
     }
 
-    fn ensure_fts_schema(conn: &Connection) {
+    fn ensure_fts_schema(storage: &SqliteStorage) {
+        let conn = storage.raw();
         let mut stmt = conn
             .prepare("PRAGMA table_info(fts_messages)")
             .expect("prepare table_info");
         let cols: Vec<String> = stmt
-            .query_map([], |row: &rusqlite::Row| row.get::<_, String>(1))
+            .query_map([], |row| row.get::<_, String>(1))
             .unwrap()
             .flatten()
             .collect();
