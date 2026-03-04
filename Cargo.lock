@@ -280,13 +280,50 @@ dependencies = [
 [[package]]
 name = "asupersync"
 version = "0.2.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "61e194ae95492f0e9bdf40266d5e04e5be34156fc650bc559200dea4146d5464"
 dependencies = [
+ "asupersync-macros",
  "base64 0.22.1",
  "bincode-next",
  "crossbeam-queue",
  "franken-decision 0.2.6",
  "franken-evidence 0.2.6",
  "franken-kernel 0.2.6",
+ "getrandom 0.4.1",
+ "hmac",
+ "io-uring",
+ "libc",
+ "memchr",
+ "nix 0.31.2",
+ "parking_lot",
+ "pin-project",
+ "polling",
+ "rmp-serde",
+ "serde",
+ "serde_json",
+ "sha1",
+ "sha2",
+ "slab",
+ "smallvec",
+ "socket2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tracing",
+ "tracing-subscriber",
+ "visibility",
+]
+
+[[package]]
+name = "asupersync"
+version = "0.2.7"
+dependencies = [
+ "base64 0.22.1",
+ "bincode-next",
+ "crossbeam-queue",
+ "franken-decision 0.2.7",
+ "franken-evidence 0.2.7",
+ "franken-kernel 0.2.7",
  "futures-lite",
  "getrandom 0.4.1",
  "hmac",
@@ -302,43 +339,6 @@ dependencies = [
  "sha1",
  "sha2",
  "signal-hook 0.3.18",
- "slab",
- "smallvec",
- "socket2",
- "tempfile",
- "thiserror 2.0.18",
- "tracing",
- "tracing-subscriber",
- "visibility",
-]
-
-[[package]]
-name = "asupersync"
-version = "0.2.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "61e194ae95492f0e9bdf40266d5e04e5be34156fc650bc559200dea4146d5464"
-dependencies = [
- "asupersync-macros",
- "base64 0.22.1",
- "bincode-next",
- "crossbeam-queue",
- "franken-decision 0.2.6 (registry+https://github.com/rust-lang/crates.io-index)",
- "franken-evidence 0.2.6 (registry+https://github.com/rust-lang/crates.io-index)",
- "franken-kernel 0.2.6 (registry+https://github.com/rust-lang/crates.io-index)",
- "getrandom 0.4.1",
- "hmac",
- "io-uring",
- "libc",
- "memchr",
- "nix 0.31.2",
- "parking_lot",
- "pin-project",
- "polling",
- "rmp-serde",
- "serde",
- "serde_json",
- "sha1",
- "sha2",
  "slab",
  "smallvec",
  "socket2",
@@ -940,7 +940,7 @@ dependencies = [
  "argon2",
  "arrayvec",
  "assert_cmd",
- "asupersync 0.2.6",
+ "asupersync 0.2.7",
  "base64 0.22.1",
  "blake3",
  "bloomfilter",
@@ -1919,6 +1919,8 @@ dependencies = [
 [[package]]
 name = "franken-decision"
 version = "0.2.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ea96efd310f2cf2350b8bd2341e1583ca12724434f2d45f51942114a93c25bd0"
 dependencies = [
  "franken-evidence 0.2.6",
  "franken-kernel 0.2.6",
@@ -1927,21 +1929,11 @@ dependencies = [
 
 [[package]]
 name = "franken-decision"
-version = "0.2.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ea96efd310f2cf2350b8bd2341e1583ca12724434f2d45f51942114a93c25bd0"
+version = "0.2.7"
 dependencies = [
- "franken-evidence 0.2.6 (registry+https://github.com/rust-lang/crates.io-index)",
- "franken-kernel 0.2.6 (registry+https://github.com/rust-lang/crates.io-index)",
+ "franken-evidence 0.2.7",
+ "franken-kernel 0.2.7",
  "serde",
-]
-
-[[package]]
-name = "franken-evidence"
-version = "0.2.6"
-dependencies = [
- "serde",
- "serde_json",
 ]
 
 [[package]]
@@ -1955,10 +1947,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "franken-kernel"
-version = "0.2.6"
+name = "franken-evidence"
+version = "0.2.7"
 dependencies = [
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -1971,10 +1964,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "franken-kernel"
+version = "0.2.7"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "frankensearch"
 version = "0.1.0"
 dependencies = [
- "asupersync 0.2.6 (registry+https://github.com/rust-lang/crates.io-index)",
+ "asupersync 0.2.6",
  "frankensearch-core",
  "frankensearch-embed",
  "frankensearch-fusion",
@@ -1988,7 +1988,7 @@ dependencies = [
 name = "frankensearch-core"
 version = "0.1.2"
 dependencies = [
- "asupersync 0.2.6 (registry+https://github.com/rust-lang/crates.io-index)",
+ "asupersync 0.2.6",
  "serde",
  "serde_json",
  "sha2",
@@ -2002,7 +2002,7 @@ dependencies = [
 name = "frankensearch-embed"
 version = "0.1.2"
 dependencies = [
- "asupersync 0.2.6 (registry+https://github.com/rust-lang/crates.io-index)",
+ "asupersync 0.2.6",
  "dirs",
  "frankensearch-core",
  "serde",
@@ -2015,7 +2015,7 @@ dependencies = [
 name = "frankensearch-fusion"
 version = "0.1.0"
 dependencies = [
- "asupersync 0.2.6 (registry+https://github.com/rust-lang/crates.io-index)",
+ "asupersync 0.2.6",
  "frankensearch-core",
  "frankensearch-embed",
  "frankensearch-index",
@@ -2048,7 +2048,7 @@ dependencies = [
 name = "frankensearch-lexical"
 version = "0.1.0"
 dependencies = [
- "asupersync 0.2.6 (registry+https://github.com/rust-lang/crates.io-index)",
+ "asupersync 0.2.6",
  "frankensearch-core",
  "serde",
  "serde_json",
@@ -2060,7 +2060,7 @@ dependencies = [
 name = "frankensearch-rerank"
 version = "0.1.0"
 dependencies = [
- "asupersync 0.2.6 (registry+https://github.com/rust-lang/crates.io-index)",
+ "asupersync 0.2.6",
  "dirs",
  "fastembed",
  "frankensearch-core",
@@ -2130,7 +2130,7 @@ dependencies = [
 name = "fsqlite-core"
 version = "0.1.1"
 dependencies = [
- "asupersync 0.2.6 (registry+https://github.com/rust-lang/crates.io-index)",
+ "asupersync 0.2.6",
  "blake3",
  "fsqlite-ast",
  "fsqlite-btree",
@@ -2290,6 +2290,7 @@ dependencies = [
 name = "fsqlite-types"
 version = "0.1.1"
 dependencies = [
+ "asupersync 0.2.6",
  "bitflags 2.11.0",
  "blake3",
  "fsqlite-error",
@@ -2322,7 +2323,7 @@ name = "fsqlite-vfs"
 version = "0.1.2"
 dependencies = [
  "advisory-lock",
- "asupersync 0.2.6 (registry+https://github.com/rust-lang/crates.io-index)",
+ "asupersync 0.2.6",
  "fsqlite-error",
  "fsqlite-observability",
  "fsqlite-types",
@@ -2336,7 +2337,7 @@ dependencies = [
 name = "fsqlite-wal"
 version = "0.1.1"
 dependencies = [
- "asupersync 0.2.6 (registry+https://github.com/rust-lang/crates.io-index)",
+ "asupersync 0.2.6",
  "blake3",
  "crc32c",
  "fsqlite-error",
