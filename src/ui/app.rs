@@ -6996,6 +6996,9 @@ impl CassApp {
             .split(inner);
         *self.last_pane_rects.borrow_mut() = pane_chunks.to_vec();
         *self.last_pane_first_index.borrow_mut() = safe_scroll_offset;
+        // Store the full results-strip inner rect so visible_pane_capacity()
+        // computes the correct pane count when the detail pane is open.
+        *self.last_results_inner.borrow_mut() = Some(inner);
 
         for (vis_idx, pane_idx) in (safe_scroll_offset..visible_end).enumerate() {
             let Some(pane) = self.panes.get(pane_idx) else {
@@ -7067,10 +7070,6 @@ impl CassApp {
                 });
             let pane_inner = pane_block.inner(pane_rect);
             pane_block.render(pane_rect, frame);
-
-            if is_active {
-                *self.last_results_inner.borrow_mut() = Some(pane_inner);
-            }
 
             if pane_inner.is_empty() || pane.hits.is_empty() {
                 continue;
@@ -14382,6 +14381,7 @@ impl super::ftui_adapter::Model for CassApp {
                     FocusDirection::Down => NavDirection::Down,
                 };
                 self.focus_manager.navigate(nav_dir);
+                self.adjust_pane_scroll_offset();
                 ftui::Cmd::none()
             }
             CassMsg::DetailScrolled { delta } => {
