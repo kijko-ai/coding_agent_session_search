@@ -19436,16 +19436,25 @@ pub fn build_resize_config(
     // Evidence sink: write resize/BOCPD decision logs to data_dir.
     // Consumed by the explainability cockpit (1mfw3.3.x) for UI-facing
     // evidence summaries and the inspector's resize panel.
-    let evidence_path = dotenvy::var("CASS_RESIZE_EVIDENCE_FILE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| data_dir.join("resize_evidence.jsonl"));
-    let evidence_sink = if bocpd_disabled {
+    //
+    // Opt-in only: set FTUI_RECORD_RESIZE=1 to enable evidence logging.
+    // Without this, the file is never created, avoiding unbounded disk
+    // growth when the TUI is in a broken state (issue #108).
+    let evidence_recording_enabled = dotenvy::var("FTUI_RECORD_RESIZE")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
+    let evidence_sink = if bocpd_disabled || !evidence_recording_enabled {
         EvidenceSinkConfig::disabled()
     } else {
+        let evidence_path = dotenvy::var("CASS_RESIZE_EVIDENCE_FILE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| data_dir.join("resize_evidence.jsonl"));
         EvidenceSinkConfig {
             enabled: true,
             destination: EvidenceSinkDestination::file(&evidence_path),
             flush_on_write: false, // batch flush for lower I/O overhead
+            max_bytes: ftui::runtime::evidence_sink::DEFAULT_MAX_EVIDENCE_BYTES,
         }
     };
 
@@ -34792,6 +34801,7 @@ See also: [RFC-2847](https://internal/rfc/2847) for the full design doc.
             enabled: true,
             destination: EvidenceSinkDestination::file(&evidence_path),
             flush_on_write: false,
+            max_bytes: ftui::runtime::evidence_sink::DEFAULT_MAX_EVIDENCE_BYTES,
         };
 
         assert!(config.enabled);
@@ -36390,33 +36400,10 @@ See also: [RFC-2847](https://internal/rfc/2847) for the full design doc.
         assert_eq!(coal_a.burst_delay_ms, coal_b.burst_delay_ms);
         assert_eq!(coal_a.hard_deadline_ms, coal_b.hard_deadline_ms);
 
-        // Evidence sink enabled state matches
+        // Evidence sink enabled state matches (disabled by default since
+        // FTUI_RECORD_RESIZE is not set in test env).
         assert_eq!(sink_a.enabled, sink_b.enabled);
-        assert_eq!(sink_a.flush_on_write, sink_b.flush_on_write);
-
-        // Evidence paths differ only by data_dir prefix
-        assert!(
-            matches!(
-                (&sink_a.destination, &sink_b.destination),
-                (
-                    ftui::runtime::evidence_sink::EvidenceSinkDestination::File(_),
-                    ftui::runtime::evidence_sink::EvidenceSinkDestination::File(_)
-                )
-            ),
-            "expected file destinations"
-        );
-        if let (
-            ftui::runtime::evidence_sink::EvidenceSinkDestination::File(pa),
-            ftui::runtime::evidence_sink::EvidenceSinkDestination::File(pb),
-        ) = (&sink_a.destination, &sink_b.destination)
-        {
-            assert_ne!(pa, pb, "paths should differ across data dirs");
-            assert!(
-                pa.ends_with("resize_evidence.jsonl"),
-                "evidence file name must be consistent"
-            );
-            assert!(pb.ends_with("resize_evidence.jsonl"));
-        }
+        assert!(!sink_a.enabled, "evidence sink should be disabled by default (opt-in via FTUI_RECORD_RESIZE=1)");
     }
 
     #[test]
@@ -36432,11 +36419,11 @@ See also: [RFC-2847](https://internal/rfc/2847) for the full design doc.
             "bocpd_config must be present"
         );
 
-        // Evidence sink should be active
-        assert!(evidence_sink.enabled, "evidence sink must be enabled");
+        // Evidence sink is opt-in (requires FTUI_RECORD_RESIZE=1).
+        // In default test env it should be disabled.
         assert!(
-            !evidence_sink.flush_on_write,
-            "batch flush for lower I/O overhead"
+            !evidence_sink.enabled,
+            "evidence sink must be disabled by default (issue #108: opt-in to prevent unbounded disk growth)"
         );
     }
 
