@@ -5487,8 +5487,12 @@ impl CassApp {
     }
 
     fn visible_pane_capacity(&self) -> usize {
-        self.last_content_area
+        // Use the results-pane inner rect (not full content area) so the
+        // pane-strip scroll offset matches how many panes actually fit on
+        // screen.  Falls back to full content area, then MAX_VISIBLE_PANES.
+        self.last_results_inner
             .borrow()
+            .or(*self.last_content_area.borrow())
             .map_or(MAX_VISIBLE_PANES, |rect| {
                 max_visible_panes_for_width(rect.width)
             })
