@@ -8777,6 +8777,8 @@ fn run_doctor(
                                     auto_fix_applied = true;
                                 }
                                 Err(e) => {
+                                    // Rollback dangling transaction from failed INSERT loop
+                                    let _ = conn.execute_batch("ROLLBACK;");
                                     add_check!(
                                         "fts_table",
                                         "fail",

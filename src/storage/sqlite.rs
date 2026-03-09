@@ -2602,29 +2602,36 @@ impl FrankenStorage {
         let mut offset: i64 = 0;
 
         self.conn.execute_batch("BEGIN;")?;
-        self.conn.execute_batch("DELETE FROM fts_messages;")?;
-        while offset < total_count {
-            info!(
-                "Rebuilding FTS: {}/{} rows...",
-                offset.min(total_count),
-                total_count
-            );
-            self.conn.execute_batch(&format!(
-                "INSERT INTO fts_messages(content, title, agent, workspace, source_path, created_at, message_id)
-                 SELECT m.content, c.title, a.slug, w.path, c.source_path, m.created_at, m.id
-                 FROM messages m
-                 JOIN conversations c ON m.conversation_id = c.id
-                 JOIN agents a ON c.agent_id = a.id
-                 LEFT JOIN workspaces w ON c.workspace_id = w.id
-                 ORDER BY m.rowid
-                 LIMIT {} OFFSET {};",
-                batch_size, offset
-            ))?;
-            offset += batch_size;
+        let result = (|| -> Result<()> {
+            self.conn.execute_batch("DELETE FROM fts_messages;")?;
+            while offset < total_count {
+                info!(
+                    "Rebuilding FTS: {}/{} rows...",
+                    offset.min(total_count),
+                    total_count
+                );
+                self.conn.execute_batch(&format!(
+                    "INSERT INTO fts_messages(content, title, agent, workspace, source_path, created_at, message_id)
+                     SELECT m.content, c.title, a.slug, w.path, c.source_path, m.created_at, m.id
+                     FROM messages m
+                     JOIN conversations c ON m.conversation_id = c.id
+                     JOIN agents a ON c.agent_id = a.id
+                     LEFT JOIN workspaces w ON c.workspace_id = w.id
+                     ORDER BY m.rowid
+                     LIMIT {} OFFSET {};",
+                    batch_size, offset
+                ))?;
+                offset += batch_size;
+            }
+            self.conn.execute_batch("COMMIT;")?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = self.conn.execute_batch("ROLLBACK;");
+        } else {
+            info!("Rebuilding FTS: {}/{} rows complete.", total_count, total_count);
         }
-        self.conn.execute_batch("COMMIT;")?;
-        info!("Rebuilding FTS: {}/{} rows complete.", total_count, total_count);
-        Ok(())
+        result
     }
 
     /// Fetch all messages for embedding generation.
